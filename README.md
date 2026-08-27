@@ -15,6 +15,9 @@ tagged source you can read):
 
 ```sh
 go install github.com/naz-ovh/forkman/cmd/forkman@latest
+```
+
+```sh
 go install github.com/naz-ovh/forkman/cmd/forkman@v0.1.1   # or pin a release
 ```
 
