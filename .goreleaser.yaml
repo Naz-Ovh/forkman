@@ -1,0 +1,79 @@
+# GoReleaser v2 configuration.
+# Publishes to GitHub when GITHUB_TOKEN is set, or to GitLab when GITLAB_TOKEN is set.
+# Asset names follow the <name>_<version>_<os>_<arch>.<ext> convention that
+# github.com/marcosnils/bin resolves automatically:  bin install github.com/naz-ovh/forkman
+version: 2
+
+project_name: forkman
+
+before:
+  hooks:
+    - go mod tidy
+    - ./scripts/check-deps.sh
+
+builds:
+  - id: forkman
+    main: .
+    binary: forkman
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: default
+    ids: [forkman]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE*
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: naz-ovh
+    name: forkman
+  draft: false
+  prerelease: auto
+  mode: replace
+  footer: |
+    ### Install with [bin](https://github.com/marcosnils/bin)
+
+        bin install github.com/naz-ovh/forkman
+
+# Used only when releasing from GitLab CI (GITLAB_TOKEN present, GITHUB_TOKEN absent).
+gitlab_urls:
+  use_package_registry: false

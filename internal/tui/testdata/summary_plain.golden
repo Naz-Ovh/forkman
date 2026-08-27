@@ -1,0 +1,50 @@
+== work ==
+  Syncing 0x-fork                                               4/5 · 2 failed
+  ████████████████████████████████████████████████░░░░░░░░░░░░  80%
+
+❯   ✔ tempo                       fast-forward · 1181 commits               2.4s
+  ▸ ✖ tempo-alloy                 422 · branch protection                   0.8s
+  ▸ ✖ vault-core                  409 · diverged                            1.1s
+    ⠋ sonic-mev
+    ○ old-tools                   already up to date                        0.3s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ↑↓ move · enter expand · e failures · q cancel                api: 4832 left
+== summary ==
+  Summary 0x-fork                                                      5 repos
+  ✔ 1 synced · ○ 1 up to date · – 0 skipped · ✖ 1 failed · ✖ 1 diverged
+  note: workflow-file capability could not be verified in advance
+
+    ✔ tempo                       fast-forward · 1181 commits               2.4s
+❯ ▾ ✖ tempo-alloy                 422 · branch protection                   0.8s
+        refusing to allow a Personal Access Token to create or update workflow
+  ▸ ✖ vault-core                  409 · diverged                            1.1s
+    ⠋ sonic-mev
+    ○ old-tools                   already up to date                        0.3s
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ↑↓ move · enter expand · e failures · q quit                  api: 4832 left

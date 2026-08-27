@@ -1,0 +1,39 @@
+# GitLab CI: verify on every push, release with GoReleaser on tags.
+# Set GITLAB_TOKEN (scope: api) as a masked, protected CI/CD variable so
+# GoReleaser can create the GitLab release and attach the assets.
+stages:
+  - verify
+  - release
+
+variables:
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: auto
+  # Full history so GoReleaser can diff between tags for the changelog.
+  GIT_DEPTH: 0
+
+verify:
+  stage: verify
+  image: golang:1.27
+  cache:
+    key: go-mod
+    paths:
+      - .go/pkg/mod
+  variables:
+    GOPATH: $CI_PROJECT_DIR/.go
+  script:
+    - make fmt
+    - make vet
+    - make test
+    - make deps-check
+    - make build
+    - make size
+
+release:
+  stage: release
+  image:
+    name: goreleaser/goreleaser:v2
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  script:
+    - goreleaser release --clean
