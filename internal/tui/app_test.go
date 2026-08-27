@@ -2,6 +2,7 @@ package tui
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,6 +68,31 @@ func doneEv(name string, st sync.Status, detail string, d time.Duration, log ...
 
 func startEv(name string) eventMsg {
 	return eventMsg{sync.Event{Name: name, Kind: sync.EvStarted}}
+}
+
+func logEv(name, line string) eventMsg {
+	return eventMsg{sync.Event{Name: name, Kind: sync.EvLog, Line: line}}
+}
+
+// expandedLines returns the log lines rendered under row i.
+func expandedLines(m appModel, i int) []string {
+	var out []string
+	seen := false
+	for _, l := range m.displayLines() {
+		switch {
+		case l.row == i:
+			seen = true
+		case l.row >= 0:
+			if seen {
+				return out
+			}
+		default:
+			if seen {
+				out = append(out, strings.TrimSpace(l.text))
+			}
+		}
+	}
+	return out
 }
 
 // ---- tests ----
@@ -176,6 +202,126 @@ func TestExpandCollapseAndExpandAllFailures(t *testing.T) {
 	m = step(t, m, kr('e'))
 	if m.rows[1].expanded || m.rows[2].expanded {
 		t.Fatal("e must collapse failures again when all are expanded")
+	}
+}
+
+// Enter must do something useful on a row that is still running: the runner
+// streams a line per step for exactly this reason.
+func TestExpandRunningRowShowsStreamedLines(t *testing.T) {
+	m := newAppModel(Options{Org: "acme", Plain: true, Tasks: mkTasks("alpha", "bravo")})
+	m = step(t, m, tea.WindowSizeMsg{Width: 80, Height: 24},
+		startEv("alpha"),
+		logEv("alpha", "compare upstream/main…"),
+		logEv("alpha", "behind 12 · ahead 0"),
+		keyEnter,
+	)
+	if !m.rows[0].expanded {
+		t.Fatal("enter did not expand the running row")
+	}
+	got := m.content()
+	for _, want := range []string{"compare upstream/main…", "behind 12 · ahead 0"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("streamed line %q not rendered while running", want)
+		}
+	}
+
+	// EvDone repeats the streamed lines in Result.Log; they must not double up.
+	m = step(t, m, doneEv("alpha", sync.Synced, "fast-forward · 12 commits", time.Second,
+		"compare upstream/main…", "behind 12 · ahead 0", "POST merge-upstream (main)", "200 fast-forward"))
+	lines := expandedLines(m, 0)
+	want := []string{"compare upstream/main…", "behind 12 · ahead 0", "POST merge-upstream (main)", "200 fast-forward"}
+	if strings.Join(lines, "|") != strings.Join(want, "|") {
+		t.Errorf("expanded log after EvDone =\n%v\nwant\n%v", lines, want)
+	}
+	if n := strings.Count(m.content(), "behind 12 · ahead 0"); n != 1 {
+		t.Errorf("line rendered %d times, want 1 (EvLog then Result.Log duplication)", n)
+	}
+}
+
+// A truncated Result.Log must not throw away the longer streamed log.
+func TestShorterResultLogDoesNotReplaceStreamedLines(t *testing.T) {
+	m := newAppModel(Options{Org: "acme", Plain: true, Tasks: mkTasks("alpha")})
+	m = step(t, m, tea.WindowSizeMsg{Width: 80, Height: 24},
+		startEv("alpha"), logEv("alpha", "one"), logEv("alpha", "two"), logEv("alpha", "three"),
+		doneEv("alpha", sync.Synced, "cloned", time.Second, "one"),
+		keyEnter,
+	)
+	if got := expandedLines(m, 0); strings.Join(got, "|") != "one|two|three" {
+		t.Errorf("expanded log = %v, want the streamed lines", got)
+	}
+}
+
+// Skipped rows never run a worker; their explanation arrives with EvDone and
+// must be reachable with enter.
+func TestSkippedRowExpandsToItsExplanation(t *testing.T) {
+	m := newAppModel(Options{Org: "acme", Plain: true, Tasks: mkTasks("alpha", "readonly")})
+	m = step(t, m, tea.WindowSizeMsg{Width: 90, Height: 24},
+		doneEv("readonly", sync.Skipped, "read-only (READ) · cannot push", 0,
+			"viewerPermission: READ — need WRITE to push",
+			"ask an org owner for write access, or exclude it: forkman configure --exclude-add readonly"),
+		keyDown, keyEnter,
+	)
+	if !m.rows[1].expanded {
+		t.Fatal("enter did not expand the skipped row")
+	}
+	if got := expandedLines(m, 1); len(got) != 2 || !strings.Contains(got[0], "viewerPermission: READ") {
+		t.Errorf("expanded skipped row = %v", got)
+	}
+	if !strings.Contains(m.content(), "viewerPermission: READ") {
+		t.Error("skip explanation not rendered")
+	}
+}
+
+// Every row shows a marker so it is obvious they all expand, and a row with
+// no output at all says so instead of silently ignoring enter.
+func TestEveryRowIsExpandableWithNoOutputFallback(t *testing.T) {
+	m := newAppModel(Options{Org: "acme", Plain: true, Tasks: mkTasks("alpha", "bravo")})
+	m = step(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	if n := strings.Count(m.content(), "▸"); n != 2 {
+		t.Errorf("%d expand markers, want one per row", n)
+	}
+
+	m = step(t, m, keyEnter)
+	if !m.rows[0].expanded {
+		t.Fatal("enter must expand a row with no log")
+	}
+	if got := expandedLines(m, 0); len(got) != 1 || got[0] != "(no output)" {
+		t.Errorf("expanded empty row = %v, want [(no output)]", got)
+	}
+	if !strings.Contains(m.content(), "▾") {
+		t.Error("expanded row must show ▾")
+	}
+	m = step(t, m, keyEnter)
+	if m.rows[0].expanded {
+		t.Error("enter must collapse again")
+	}
+}
+
+// Expanded log lines take up viewport rows, so windowing has to account for
+// them or the cursor row scrolls off screen.
+func TestExpandedLinesCountTowardWindowing(t *testing.T) {
+	names := make([]string, 12)
+	msgs := []tea.Msg{tea.WindowSizeMsg{Width: 60, Height: 14}}
+	for i := range names {
+		names[i] = fmt.Sprintf("repo%02d", i)
+	}
+	m := newAppModel(Options{Org: "acme", Plain: true, Tasks: mkTasks(names...)})
+	m = step(t, m, msgs...)
+	for i := range names {
+		m = step(t, m, doneEv(names[i], sync.Failed, "boom", time.Second,
+			"line one", "line two", "line three", "line four"))
+	}
+	// Expand everything, then walk to the bottom.
+	m = step(t, m, kr('e'))
+	for range names {
+		m = step(t, m, keyDown)
+	}
+	content := m.content()
+	if !strings.Contains(content, names[len(names)-1]) {
+		t.Fatal("cursor row scrolled out of view once logs were expanded")
+	}
+	if got := len(strings.Split(content, "\n")); got != 14 {
+		t.Fatalf("rendered %d lines at height 14", got)
 	}
 }
 

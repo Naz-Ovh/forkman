@@ -75,6 +75,9 @@ func waitForEvent(ch <-chan sync.Event) tea.Cmd {
 	}
 }
 
+// maxRowLog matches the runner's Result.Log cap.
+const maxRowLog = 200
+
 type row struct {
 	name     string
 	status   sync.Status
@@ -225,11 +228,11 @@ func (m appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// toggle expands or collapses any row. Rows that have produced no output yet
+// still expand; they show a single "(no output)" line, which is the honest
+// answer and keeps enter from feeling broken.
 func (m *appModel) toggle(i int) {
 	if i < 0 || i >= len(m.rows) {
-		return
-	}
-	if len(m.rows[i].log) == 0 {
 		return
 	}
 	m.rows[i].expanded = !m.rows[i].expanded
@@ -240,13 +243,13 @@ func (m *appModel) toggle(i int) {
 func (m *appModel) expandFailures() {
 	anyCollapsed := false
 	for _, r := range m.rows {
-		if r.failed() && len(r.log) > 0 && !r.expanded {
+		if r.failed() && !r.expanded {
 			anyCollapsed = true
 			break
 		}
 	}
 	for i := range m.rows {
-		if m.rows[i].failed() && len(m.rows[i].log) > 0 {
+		if m.rows[i].failed() {
 			m.rows[i].expanded = anyCollapsed
 		}
 	}
@@ -254,7 +257,7 @@ func (m *appModel) expandFailures() {
 
 func (m *appModel) autoExpandFirstFailure() {
 	for i := range m.rows {
-		if m.rows[i].failed() && len(m.rows[i].log) > 0 {
+		if m.rows[i].failed() {
 			m.rows[i].expanded = true
 			m.cursor = i
 			return
@@ -274,7 +277,9 @@ func (m appModel) applyEvent(ev sync.Event) appModel {
 	case sync.EvProgress:
 		// Per-repo percentage is reflected in the global bar only.
 	case sync.EvLog:
-		if ev.Line != "" {
+		// Same cap the runner puts on Result.Log, so the two stay comparable
+		// at EvDone and a chatty clone cannot grow the model without bound.
+		if ev.Line != "" && len(r.log) < maxRowLog {
 			r.log = append(r.log, ev.Line)
 		}
 	case sync.EvDone:
@@ -285,7 +290,13 @@ func (m appModel) applyEvent(ev sync.Event) appModel {
 			r.status = res.Status
 			r.detail = res.Detail
 			r.dur = res.Duration
-			r.log = append(r.log, res.Log...)
+			// The runner streams every line as EvLog and repeats them in
+			// Result.Log, so the final log replaces what was streamed rather
+			// than being appended to it. If Result.Log is the shorter of the
+			// two (its 200-line cap was hit) the streamed lines are kept.
+			if len(res.Log) >= len(r.log) {
+				r.log = res.Log
+			}
 		}
 	}
 	return m
@@ -364,7 +375,11 @@ func (m appModel) displayLines() []dline {
 	for i := range m.rows {
 		out = append(out, dline{row: i, text: m.rowLine(i)})
 		if m.rows[i].expanded {
-			for _, l := range m.rows[i].log {
+			log := m.rows[i].log
+			if len(log) == 0 {
+				log = []string{"(no output)"}
+			}
+			for _, l := range log {
 				out = append(out, dline{row: -1, text: "        " + m.th.Muted.Render(trunc(l, w-8))})
 			}
 		}
@@ -408,13 +423,10 @@ func (m appModel) rowLine(i int) string {
 	if i == m.cursor {
 		cur = th.Cursor.Render("❯ ")
 	}
-	marker := " "
-	if len(r.log) > 0 {
-		if r.expanded {
-			marker = "▾"
-		} else {
-			marker = "▸"
-		}
+	// Every row is expandable, so every row carries a marker.
+	marker := "▸"
+	if r.expanded {
+		marker = "▾"
 	}
 	g := glyph(r.status)
 	if r.status == sync.Running {

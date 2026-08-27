@@ -48,9 +48,11 @@ func (r *Runner) Run(ctx context.Context, tasks []Task, events chan<- Event) {
 	for _, t := range tasks {
 		switch {
 		case t.Skip:
-			events <- doneEvent(Result{Name: t.Fork.Name, Status: Skipped, Detail: t.SkipReason})
+			events <- doneEvent(Result{Name: t.Fork.Name, Status: Skipped, Detail: t.SkipReason, Log: t.Log})
 		case r.Kind == KindSync && t.UpToDate:
-			events <- doneEvent(Result{Name: t.Fork.Name, Status: UpToDate, Detail: "already up to date"})
+			// Clone tasks are never short-circuited: cloning always has work
+			// to do, however current the fork is.
+			events <- doneEvent(Result{Name: t.Fork.Name, Status: UpToDate, Detail: "already up to date", Log: t.Log})
 		default:
 			work = append(work, t)
 		}
@@ -110,7 +112,7 @@ func (r *Runner) execute(ctx context.Context, t Task, events chan<- Event) Resul
 	case r.GitMode:
 		res = r.doGitSync(ctx, t, events)
 	default:
-		res = r.doSync(ctx, t)
+		res = r.doSync(ctx, t, events)
 	}
 	res.Name = t.Fork.Name
 	res.Duration = r.now().Sub(start)
@@ -121,10 +123,21 @@ func (r *Runner) execute(ctx context.Context, t Task, events chan<- Event) Resul
 	return res
 }
 
-// doSync compares against the parent, then calls merge-upstream.
-func (r *Runner) doSync(ctx context.Context, t Task) Result {
+// doSync compares against the parent, then calls merge-upstream. Every step
+// is streamed as an EvLog line and kept in Result.Log, so a row can be
+// expanded while it is still running.
+func (r *Runner) doSync(ctx context.Context, t Task, events chan<- Event) Result {
 	f := t.Fork
-	res := Result{Name: f.Name}
+	res := &Result{Name: f.Name}
+	// Only this goroutine touches res, so no locking is needed.
+	logf := func(format string, a ...any) {
+		line := fmt.Sprintf(format, a...)
+		if len(res.Log) < maxLogLines {
+			res.Log = append(res.Log, line)
+		}
+		events <- Event{Name: f.Name, Kind: EvLog, Line: line}
+	}
+
 	parentOwner := github.ParentOwner(f.ParentNameWithOwner)
 	parentBranch := f.ParentDefaultBranch
 	if parentBranch == "" {
@@ -132,26 +145,33 @@ func (r *Runner) doSync(ctx context.Context, t Task) Result {
 	}
 
 	if parentOwner != "" && f.DefaultBranch != "" {
+		logf("compare upstream/%s…", parentBranch)
 		cmp, err := r.Client.Compare(ctx, r.Org, f.Name, parentOwner, parentBranch, f.DefaultBranch)
 		switch {
 		case err != nil:
 			// Compare is advisory; merge-upstream is the source of truth.
-			res.Log = append(res.Log, "compare unavailable: "+err.Error())
+			logf("compare unavailable: %s", err.Error())
 		default:
 			res.Ahead, res.Behind = cmp.AheadBy, cmp.BehindBy
+			logf("behind %d · ahead %d", cmp.BehindBy, cmp.AheadBy)
 			if cmp.Status == "diverged" {
 				res.Status = Diverged
 				res.Detail = fmt.Sprintf("diverged · %d ahead, %d behind", cmp.AheadBy, cmp.BehindBy)
-				res.Log = append(res.Log, divergedHelp(cmp.AheadBy, cmp.BehindBy, parentBranch)...)
-				return res
+				for _, l := range divergedHelp(cmp.AheadBy, cmp.BehindBy, parentBranch) {
+					logf("%s", l)
+				}
+				return *res
 			}
 		}
 	}
 
+	logf("POST merge-upstream (%s)", f.DefaultBranch)
 	mr, err := r.Client.MergeUpstream(ctx, r.Org, f.Name, f.DefaultBranch)
 	if err != nil {
-		return r.mergeFailure(res, err, parentBranch)
+		r.mergeFailure(res, err, parentBranch, logf)
+		return *res
 	}
+	logf("200 %s", mr.MergeType)
 	switch mr.MergeType {
 	case "fast-forward":
 		res.Status, res.MergeType = Synced, mr.MergeType
@@ -174,30 +194,34 @@ func (r *Runner) doSync(ctx context.Context, t Task) Result {
 		}
 	}
 	res.Message = mr.Message
-	return res
+	return *res
 }
 
-func (r *Runner) mergeFailure(res Result, err error, parentBranch string) Result {
+func (r *Runner) mergeFailure(res *Result, err error, parentBranch string, logf func(string, ...any)) {
 	var ae *github.APIError
 	if !errors.As(err, &ae) {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			res.Status, res.Detail, res.Err = Failed, interruptedDetail, err
-			return res
+			return
 		}
 		res.Status, res.Detail, res.Err = Failed, "request failed", err
 		res.Message = err.Error()
-		return res
+		logf("request failed: %s", err.Error())
+		return
 	}
 	res.Err = ae
 	res.Message = ae.Message
+	logf("%d from merge-upstream", ae.Status)
 	switch {
 	case ae.Status == 409:
 		res.Status, res.Detail = Diverged, "409 · diverged"
-		res.Log = append(res.Log, divergedHelp(res.Ahead, res.Behind, parentBranch)...)
+		for _, l := range divergedHelp(res.Ahead, res.Behind, parentBranch) {
+			logf("%s", l)
+		}
 	case ae.Status == 422:
 		res.Status = Failed
 		res.Detail = "422 · " + shortReason(ae.Message)
-		res.Log = append(res.Log, ae.Message)
+		logf("%s", ae.Message)
 	case ae.Status == 403:
 		res.Status = Failed
 		switch {
@@ -208,13 +232,12 @@ func (r *Runner) mergeFailure(res Result, err error, parentBranch string) Result
 		default:
 			res.Detail = "403 · permission denied"
 		}
-		res.Log = append(res.Log, ae.Message)
+		logf("%s", ae.Message)
 	default:
 		res.Status = Failed
 		res.Detail = fmt.Sprintf("%d · %s", ae.Status, shortReason(ae.Message))
-		res.Log = append(res.Log, ae.Message)
+		logf("%s", ae.Message)
 	}
-	return res
 }
 
 func divergedHelp(ahead, behind int, parentBranch string) []string {
@@ -276,6 +299,11 @@ func (r *Runner) doClone(ctx context.Context, t Task, events chan<- Event) Resul
 		events <- Event{Name: f.Name, Kind: EvProgress, Percent: p}
 	}
 
+	if existed {
+		onLine("already cloned: " + dir)
+	} else {
+		onLine("git clone " + f.NameWithOwner + " → " + dir)
+	}
 	err := clone.Run(ctx, clone.Options{
 		ForkURL:     r.cloneURL(f.NameWithOwner),
 		UpstreamURL: r.cloneURL(f.ParentNameWithOwner),
@@ -379,6 +407,11 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 		return res
 	}
 
+	if clone.IsRepo(o.Dir) {
+		logf("local clone: " + o.Dir)
+	} else {
+		logf("git clone " + f.NameWithOwner + " → " + o.Dir)
+	}
 	if err := clone.EnsureClone(ctx, o, logf, onPercent); err != nil {
 		if ctx.Err() != nil {
 			res.Status, res.Detail, res.Err = Failed, interruptedDetail, ctx.Err()
@@ -390,10 +423,12 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 	}
 	// forkman owns this folder, so keep origin on the configured protocol even
 	// when the clone was made earlier over a different one.
+	gitStep(logf, "remote", "set-url", "origin", o.ForkURL)
 	if g := clone.Git(ctx, o, "remote", "set-url", "origin", o.ForkURL); !g.OK() {
 		logf("could not set origin url: " + g.Reason())
 	}
 	for _, remote := range []string{"upstream", "origin"} {
+		gitStep(logf, "fetch", remote, "--prune")
 		if err := clone.Stream(ctx, o, logf, onPercent, "fetch", "--progress", remote, "--prune"); err != nil {
 			if ctx.Err() != nil {
 				res.Status, res.Detail, res.Err = Failed, interruptedDetail, ctx.Err()
@@ -414,7 +449,9 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 		res.Ahead, res.Behind = revCounts(ctx, o, originRef, upRef)
 		res.Status = Diverged
 		res.Detail = fmt.Sprintf("diverged · %d ahead, %d behind", res.Ahead, res.Behind)
-		res.Log = append(res.Log, divergedHelp(res.Ahead, res.Behind, upBranch)...)
+		for _, l := range divergedHelp(res.Ahead, res.Behind, upBranch) {
+			logf(l)
+		}
 		return res
 	default:
 		return failed("ancestry check failed", anc)
@@ -429,6 +466,7 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 		res.Status, res.Detail, res.Err = Failed, "commit count failed", err
 		return res
 	}
+	logf(fmt.Sprintf("behind %d · ahead 0", n))
 	if n == 0 {
 		res.Status, res.Detail = UpToDate, "already up to date"
 		return res
@@ -436,6 +474,9 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 
 	// Fast-forward push straight from the fetched upstream ref: no working
 	// tree checkout is needed, and a non-fast-forward is refused by git.
+	gitStep(logf, "push", "origin", upRef+":refs/heads/"+forkBranch)
+	// mark is set after the command line so only git's own output is searched
+	// for the rejection reason.
 	mark := len(res.Log)
 	if err := clone.Stream(ctx, o, logf, onPercent, "push", "origin", upRef+":refs/heads/"+forkBranch); err != nil {
 		if ctx.Err() != nil {
@@ -451,6 +492,7 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 		return res
 	}
 
+	gitStep(logf, "fetch", "origin")
 	if g := clone.Git(ctx, o, "fetch", "origin"); !g.OK() {
 		logf("fetch origin failed: " + g.Reason())
 	}
@@ -460,6 +502,21 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 	res.Commits, res.Behind = n, n
 	res.Detail = fmt.Sprintf("fast-forward · %d commits", n)
 	return res
+}
+
+// gitStep records the git command a worker is about to run, so an expanded
+// row reads as the transcript of the work. --progress is an implementation
+// detail and is left out.
+func gitStep(logf func(string), args ...string) {
+	kept := make([]string, 0, len(args)+1)
+	kept = append(kept, "git")
+	for _, a := range args {
+		if a == "--progress" {
+			continue
+		}
+		kept = append(kept, a)
+	}
+	logf(strings.Join(kept, " "))
 }
 
 // revCounts returns how far origin is ahead of, and behind, upstream.

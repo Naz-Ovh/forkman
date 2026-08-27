@@ -56,6 +56,11 @@ type Task struct {
 	Skip       bool
 	SkipReason string
 	UpToDate   bool
+
+	// Log explains a pre-classified outcome (why it was skipped, why it is
+	// already current) so the row is expandable even though no worker ever
+	// runs for it. The runner copies it into the immediate Result.
+	Log []string
 }
 
 // Result is the outcome for one repository.

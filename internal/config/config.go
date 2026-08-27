@@ -233,23 +233,31 @@ func ResolveDir(p string) (string, error) {
 // Matching is on the bare repository name, case-insensitive, with an
 // optional trailing '*' wildcard.
 func (c *Config) IsExcluded(repoName string) bool {
+	_, ok := c.Matches(repoName)
+	return ok
+}
+
+// Matches is IsExcluded plus the pattern that matched, as written in the
+// config file, so callers can tell the user which entry hid a repository.
+func (c *Config) Matches(repoName string) (string, bool) {
 	name := strings.ToLower(repoName)
 	for _, pat := range c.Excluded {
-		p := strings.ToLower(strings.TrimSpace(pat))
+		trimmed := strings.TrimSpace(pat)
+		p := strings.ToLower(trimmed)
 		if p == "" {
 			continue
 		}
 		if strings.HasSuffix(p, "*") {
 			if strings.HasPrefix(name, strings.TrimSuffix(p, "*")) {
-				return true
+				return trimmed, true
 			}
 			continue
 		}
 		if name == p {
-			return true
+			return trimmed, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // ExpandHome replaces a leading ~ with the user's home directory.

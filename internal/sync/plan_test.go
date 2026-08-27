@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"strings"
 	"testing"
 
 	"forkman/internal/config"
@@ -40,7 +41,7 @@ func TestPlanClassification(t *testing.T) {
 		fork("maintain", func(f *github.Fork) { f.ViewerPermission = "MAINTAIN" }),
 		fork("noheads", func(f *github.Fork) { f.HeadOID, f.ParentHeadOID = "", "" }),
 	}
-	tasks := Plan(forks, cfg)
+	tasks := Plan(forks, cfg, KindSync)
 
 	if len(tasks) != len(forks) {
 		t.Fatalf("Plan returned %d tasks, want %d", len(tasks), len(forks))
@@ -65,8 +66,8 @@ func TestPlanClassification(t *testing.T) {
 		"test-thing": {true, "excluded by config", false},
 		"archived":   {true, "archived", false},
 		"orphan":     {true, "no parent", false},
-		"readonly":   {true, "insufficient permission", false},
-		"triage":     {true, "insufficient permission", false},
+		"readonly":   {true, "read-only (READ) · cannot push", false},
+		"triage":     {true, "read-only (TRIAGE) · cannot push", false},
 		"current":    {false, "", true},
 		"zeta":       {false, "", false},
 		"admin":      {false, "", false},
@@ -92,7 +93,7 @@ func TestPlanRulePrecedence(t *testing.T) {
 	f := fork("everything", func(f *github.Fork) {
 		f.Archived, f.HasParent, f.ViewerPermission = true, false, "READ"
 	})
-	tasks := Plan([]github.Fork{f}, cfg)
+	tasks := Plan([]github.Fork{f}, cfg, KindSync)
 	if tasks[0].SkipReason != "excluded by config" {
 		t.Errorf("SkipReason = %q, want %q", tasks[0].SkipReason, "excluded by config")
 	}
@@ -101,21 +102,107 @@ func TestPlanRulePrecedence(t *testing.T) {
 	f2 := fork("arch", func(f *github.Fork) {
 		f.Archived, f.HasParent, f.ViewerPermission = true, false, "READ"
 	})
-	if got := Plan([]github.Fork{f2}, &config.Config{})[0].SkipReason; got != "archived" {
+	if got := Plan([]github.Fork{f2}, &config.Config{}, KindSync)[0].SkipReason; got != "archived" {
 		t.Errorf("SkipReason = %q, want %q", got, "archived")
 	}
 
 	// Parentless beats permission.
 	f3 := fork("orph", func(f *github.Fork) { f.HasParent, f.ViewerPermission = false, "READ" })
-	if got := Plan([]github.Fork{f3}, &config.Config{})[0].SkipReason; got != "no parent" {
+	if got := Plan([]github.Fork{f3}, &config.Config{}, KindSync)[0].SkipReason; got != "no parent" {
 		t.Errorf("SkipReason = %q, want %q", got, "no parent")
 	}
 }
 
 func TestPlanNilConfig(t *testing.T) {
-	tasks := Plan([]github.Fork{fork("a")}, nil)
+	tasks := Plan([]github.Fork{fork("a")}, nil, KindSync)
 	if len(tasks) != 1 || tasks[0].Skip {
 		t.Errorf("Plan with nil config = %+v", tasks)
+	}
+}
+
+// A read-only fork can still be cloned: the permission rule exists because
+// syncing pushes, and cloning does not.
+func TestPlanPermissionRuleIsSyncOnly(t *testing.T) {
+	f := fork("readonly", func(f *github.Fork) { f.ViewerPermission = "READ" })
+
+	sync := Plan([]github.Fork{f}, nil, KindSync)[0]
+	if !sync.Skip {
+		t.Fatal("sync must skip a fork the viewer cannot push to")
+	}
+	if sync.SkipReason != "read-only (READ) · cannot push" {
+		t.Errorf("SkipReason = %q", sync.SkipReason)
+	}
+	if len(sync.Log) != 2 ||
+		!strings.Contains(sync.Log[0], "viewerPermission: READ") ||
+		!strings.Contains(sync.Log[1], "--exclude-add readonly") {
+		t.Errorf("skip explanation = %#v", sync.Log)
+	}
+
+	cl := Plan([]github.Fork{f}, nil, KindClone)[0]
+	if cl.Skip {
+		t.Errorf("clone must not skip a read-only fork: %q", cl.SkipReason)
+	}
+	if cl.UpToDate {
+		t.Error("clone tasks are never up to date")
+	}
+}
+
+// An unset viewerPermission is still not writable, but must not render as an
+// empty pair of brackets.
+func TestPlanUnknownPermission(t *testing.T) {
+	f := fork("mystery", func(f *github.Fork) { f.ViewerPermission = "" })
+	got := Plan([]github.Fork{f}, nil, KindSync)[0]
+	if !got.Skip || got.SkipReason != "read-only (UNKNOWN) · cannot push" {
+		t.Errorf("skip=%v reason=%q", got.Skip, got.SkipReason)
+	}
+}
+
+func TestPlanUpToDateIsSyncOnly(t *testing.T) {
+	f := fork("current", func(f *github.Fork) {
+		f.HeadOID, f.ParentHeadOID = "abcdef1234567890", "abcdef1234567890"
+	})
+
+	sync := Plan([]github.Fork{f}, nil, KindSync)[0]
+	if !sync.UpToDate {
+		t.Fatal("equal head OIDs must be up to date for sync")
+	}
+	if len(sync.Log) != 1 || sync.Log[0] != "fork abcdef1 == upstream abcdef1" {
+		t.Errorf("up-to-date explanation = %#v", sync.Log)
+	}
+
+	cl := Plan([]github.Fork{f}, nil, KindClone)[0]
+	if cl.UpToDate || cl.Skip {
+		t.Errorf("clone task = skip:%v upToDate:%v, want work to be done", cl.Skip, cl.UpToDate)
+	}
+}
+
+func TestPlanCloneStillSkipsExcludedArchivedAndOrphans(t *testing.T) {
+	cfg := &config.Config{Excluded: []string{"drop-*"}}
+	forks := []github.Fork{
+		fork("drop-me"),
+		fork("archived", func(f *github.Fork) { f.Archived = true }),
+		fork("orphan", func(f *github.Fork) { f.HasParent = false }),
+	}
+	want := map[string]string{
+		"drop-me":  "excluded by config",
+		"archived": "archived",
+		"orphan":   "no parent",
+	}
+	for _, tk := range Plan(forks, cfg, KindClone) {
+		if !tk.Skip || tk.SkipReason != want[tk.Fork.Name] {
+			t.Errorf("%s: skip=%v reason=%q, want %q", tk.Fork.Name, tk.Skip, tk.SkipReason, want[tk.Fork.Name])
+		}
+		if len(tk.Log) == 0 {
+			t.Errorf("%s: skipped task has no explanation", tk.Fork.Name)
+		}
+	}
+}
+
+func TestPlanExcludedNamesThePattern(t *testing.T) {
+	cfg := &config.Config{Excluded: []string{"Test-*"}}
+	got := Plan([]github.Fork{fork("test-thing")}, cfg, KindSync)[0]
+	if len(got.Log) == 0 || got.Log[0] != `excluded by config pattern "Test-*"` {
+		t.Errorf("explanation = %#v", got.Log)
 	}
 }
 

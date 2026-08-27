@@ -115,7 +115,7 @@ func TestRunnerOneDonePerTask(t *testing.T) {
 		fork("archived", func(f *github.Fork) { f.Archived = true }),
 		fork("current", func(f *github.Fork) { f.ParentHeadOID = "fork-oid" }),
 	}
-	tasks := Plan(forks, cfg)
+	tasks := Plan(forks, cfg, KindSync)
 
 	events := make(chan Event, 1)
 	go r.Run(context.Background(), tasks, events)
@@ -177,9 +177,9 @@ func TestRunnerOneDonePerTask(t *testing.T) {
 	if c := got["ff"].Commits; c != 1181 {
 		t.Errorf("ff Commits = %d, want 1181 (from compare behind_by)", c)
 	}
-	if log := got["diverged-cmp"].Log; len(log) != 4 ||
-		log[0] != "Your branch is 3 ahead, 12 behind upstream:main." ||
-		!strings.Contains(log[3], "git fetch upstream && git rebase upstream/main") {
+	divLog := strings.Join(got["diverged-cmp"].Log, "\n")
+	if !strings.Contains(divLog, "Your branch is 3 ahead, 12 behind upstream:main.") ||
+		!strings.Contains(divLog, "git fetch upstream && git rebase upstream/main") {
 		t.Errorf("diverged log = %#v", got["diverged-cmp"].Log)
 	}
 	if len(got["conflict"].Log) == 0 {
@@ -195,10 +195,134 @@ func TestRunnerOneDonePerTask(t *testing.T) {
 	}
 }
 
+// Rows must be expandable while the run is still going, so an API sync
+// streams every step as EvLog and repeats those same lines in Result.Log.
+func TestRunnerStreamsLogLinesDuringAPISync(t *testing.T) {
+	fs := &forkServer{
+		compare: map[string]string{"ff": `{"ahead_by":0,"behind_by":12,"status":"behind"}`},
+	}
+	r := newRunner(t, fs)
+
+	events := make(chan Event, 256)
+	var streamed []string
+	var res *Result
+	go r.Run(context.Background(), Plan([]github.Fork{fork("ff")}, nil, KindSync), events)
+	for ev := range events {
+		switch ev.Kind {
+		case EvLog:
+			if res != nil {
+				t.Error("EvLog arrived after EvDone")
+			}
+			streamed = append(streamed, ev.Line)
+		case EvDone:
+			res = ev.Result
+		}
+	}
+	if res == nil {
+		t.Fatal("no EvDone")
+	}
+	want := []string{
+		"compare upstream/main…",
+		"behind 12 · ahead 0",
+		"POST merge-upstream (main)",
+		"200 fast-forward",
+	}
+	if strings.Join(streamed, "\n") != strings.Join(want, "\n") {
+		t.Errorf("streamed lines =\n%s\nwant\n%s", strings.Join(streamed, "\n"), strings.Join(want, "\n"))
+	}
+	// (a) in the dedup contract: Result.Log carries exactly what was streamed,
+	// and the TUI replaces rather than appends.
+	if strings.Join(res.Log, "\n") != strings.Join(streamed, "\n") {
+		t.Errorf("Result.Log =\n%s\nwant the streamed lines\n%s",
+			strings.Join(res.Log, "\n"), strings.Join(streamed, "\n"))
+	}
+}
+
+// A failing sync logs the status and the verbatim GitHub message, and keeps
+// Message for plain/JSON output.
+func TestRunnerLogsFailureDetail(t *testing.T) {
+	fs := &forkServer{merge: map[string]struct {
+		status int
+		body   string
+	}{"protected": {422, `{"message":"Protected branch update failed for refs/heads/main"}`}}}
+	r := newRunner(t, fs)
+	events := make(chan Event, 256)
+	go r.Run(context.Background(), Plan([]github.Fork{fork("protected")}, nil, KindSync), events)
+	results, _, _ := collect(events)
+	log := strings.Join(results[0].Log, "\n")
+	if !strings.Contains(log, "422 from merge-upstream") ||
+		!strings.Contains(log, "Protected branch update failed for refs/heads/main") {
+		t.Errorf("failure log =\n%s", log)
+	}
+	if results[0].Message != "Protected branch update failed for refs/heads/main" {
+		t.Errorf("Message = %q", results[0].Message)
+	}
+}
+
+// Pre-classified rows never run a worker, so their explanation has to come
+// with the immediate EvDone or the row would expand to nothing.
+func TestRunnerPreClassifiedRowsCarryExplanations(t *testing.T) {
+	r := newRunner(t, &forkServer{})
+	cfg := &config.Config{Excluded: []string{"banned"}}
+	forks := []github.Fork{
+		fork("banned"),
+		fork("readonly", func(f *github.Fork) { f.ViewerPermission = "READ" }),
+		fork("archived", func(f *github.Fork) { f.Archived = true }),
+		fork("current", func(f *github.Fork) { f.ParentHeadOID = "fork-oid" }),
+	}
+	events := make(chan Event, 256)
+	go r.Run(context.Background(), Plan(forks, cfg, KindSync), events)
+	results, _, _ := collect(events)
+	if len(results) != 4 {
+		t.Fatalf("got %d results, want 4", len(results))
+	}
+	want := map[string]string{
+		"banned":   `excluded by config pattern "banned"`,
+		"readonly": "viewerPermission: READ",
+		"archived": "archived repositories cannot be pushed to",
+		"current":  "fork fork-oi == upstream fork-oi",
+	}
+	for _, res := range results {
+		if len(res.Log) == 0 {
+			t.Errorf("%s: no explanation in Result.Log", res.Name)
+			continue
+		}
+		if !strings.Contains(strings.Join(res.Log, "\n"), want[res.Name]) {
+			t.Errorf("%s: log = %#v, want a line containing %q", res.Name, res.Log, want[res.Name])
+		}
+		if len(res.Log) > 3 {
+			t.Errorf("%s: %d explanation lines, want at most 3", res.Name, len(res.Log))
+		}
+	}
+}
+
+// A clone task is real work even when the fork's head already matches its
+// parent's, so the runner must not report it as up to date without running.
+func TestRunnerNeverShortCircuitsCloneTasks(t *testing.T) {
+	r := newRunner(t, &forkServer{})
+	r.Kind = KindClone
+	r.CloneDir = t.TempDir()
+	r.URLFor = func(string) string { return "" } // fail fast; we only inspect routing
+	f := fork("current", func(f *github.Fork) { f.ParentHeadOID = "fork-oid" })
+
+	events := make(chan Event, 256)
+	go r.Run(context.Background(), Plan([]github.Fork{f}, nil, KindClone), events)
+	results, _, started := collect(events)
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	if started["current"] != 1 {
+		t.Fatalf("EvStarted count = %d, want 1: the clone worker must run", started["current"])
+	}
+	if results[0].Status == UpToDate {
+		t.Error("clone task reported as up to date")
+	}
+}
+
 func TestRunnerClosesChannel(t *testing.T) {
 	r := newRunner(t, &forkServer{})
 	events := make(chan Event, 32)
-	go r.Run(context.Background(), Plan([]github.Fork{fork("a")}, nil), events)
+	go r.Run(context.Background(), Plan([]github.Fork{fork("a")}, nil, KindSync), events)
 	for range events {
 	}
 	// A second receive on a closed channel returns immediately.
@@ -238,7 +362,7 @@ func TestRunnerCancellation(t *testing.T) {
 
 	forks := []github.Fork{fork("a"), fork("b"), fork("c"), fork("d"), fork("e")}
 	forks = append(forks, fork("skipme", func(f *github.Fork) { f.Archived = true }))
-	tasks := Plan(forks, nil)
+	tasks := Plan(forks, nil, KindSync)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan Event, 256)
@@ -280,7 +404,7 @@ func TestRunnerCancelledBeforeStart(t *testing.T) {
 	r := newRunner(t, &forkServer{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	tasks := Plan([]github.Fork{fork("a"), fork("b")}, nil)
+	tasks := Plan([]github.Fork{fork("a"), fork("b")}, nil, KindSync)
 	events := make(chan Event, 32)
 	go r.Run(ctx, tasks, events)
 	results, done, _ := collect(events)

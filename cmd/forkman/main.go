@@ -214,7 +214,7 @@ func cmdRun(args []string, kind fsync.Kind) int {
 
 	interactive := isTTY(os.Stdout) && isTTY(os.Stdin)
 	usePlain := *plainOut || *jsonOut || !interactive
-	tasks := fsync.Plan(forks, cfg)
+	tasks := fsync.Plan(forks, cfg, kind)
 
 	// First run: the config has never carried an "excluded" key.
 	if !usePlain && cfg.Excluded == nil {
@@ -238,7 +238,7 @@ func cmdRun(args []string, kind fsync.Kind) int {
 			fmt.Fprintln(os.Stderr, "forkman:", err)
 			return exitInternal
 		}
-		tasks = fsync.Plan(forks, cfg)
+		tasks = fsync.Plan(forks, cfg, kind)
 	}
 
 	w := &plain.Writer{W: os.Stdout, JSON: *jsonOut}
@@ -515,7 +515,7 @@ func configureInteractive(path string, cfg *config.Config) int {
 		fmt.Fprintln(os.Stderr, "forkman: discover forks:", err)
 		return discoverCode(err)
 	}
-	tasks := fsync.Plan(forks, cfg)
+	tasks := fsync.Plan(forks, cfg, fsync.KindSync)
 	selected, cancelled, err := tui.RunSelector(ctx, cfg.Org, selectorItems(tasks), cfg.Excluded)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "forkman:", err)

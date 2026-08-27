@@ -406,3 +406,24 @@ func TestResolveDir(t *testing.T) {
 		t.Errorf("ErrEmptyDir = %q", ErrEmptyDir)
 	}
 }
+
+func TestMatchesNamesThePattern(t *testing.T) {
+	c := &Config{Excluded: []string{" Legacy ", "Test-*"}}
+	cases := []struct {
+		name, pattern string
+		ok            bool
+	}{
+		{"legacy", "Legacy", true},
+		{"test-thing", "Test-*", true},
+		{"keeper", "", false},
+	}
+	for _, tc := range cases {
+		pat, ok := c.Matches(tc.name)
+		if ok != tc.ok || pat != tc.pattern {
+			t.Errorf("Matches(%q) = %q, %v; want %q, %v", tc.name, pat, ok, tc.pattern, tc.ok)
+		}
+		if got := c.IsExcluded(tc.name); got != tc.ok {
+			t.Errorf("IsExcluded(%q) = %v, want %v", tc.name, got, tc.ok)
+		}
+	}
+}
