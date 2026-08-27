@@ -54,8 +54,22 @@ during discovery and cost no further API calls. Diverged branches are reported
 with the commands to resolve them locally; forkman never writes to upstream and
 never attempts a conflict resolution.
 
-`clone` clones each fork with `--filter=blob:none` (use `--full` to opt out),
-adds a push-disabled `upstream` remote, and fetches it.
+`clone` gives you every fork's **history**, not its files: it clones with
+`--filter=blob:none --no-checkout`, adds a push-disabled `upstream` remote and
+fetches it. Each `<cloneDir>/<repoName>` therefore holds a complete commit and
+tree history with zero file contents downloaded, and the folder looks empty —
+the row logs `history only (blob:none, no checkout)` to say so. That is the
+point: keeping fifty forks' commit graphs current costs a fraction of keeping
+fifty working trees.
+
+When you do want the files in one of them, ask git for them:
+
+```sh
+cd ~/src/forks/tempo && git checkout main   # blobs are fetched on demand
+```
+
+Or clone with working trees from the start with `forkman clone --full`, which is
+a plain `git clone` — every blob, files checked out.
 
 `doctor` runs every preflight check and prints a pass/fail table without doing
 any work, including which sync mode is configured.
@@ -87,7 +101,7 @@ at its parent's head is skipped with no git work at all. For every other fork
 forkman runs, in `<cloneDir>/<repoName>`:
 
 ```sh
-git clone --progress [--filter=blob:none] <fork-url> <dir>   # only if missing
+git clone --progress [--filter=blob:none --no-checkout] <fork-url> <dir>  # if missing
 git remote add upstream <parent-url>                         # or remote set-url
 git remote set-url --push upstream no_push
 git remote set-url origin <fork-url>                         # keep the protocol
@@ -97,14 +111,24 @@ git merge-base --is-ancestor refs/remotes/origin/<b> refs/remotes/upstream/<b>
 git rev-list --count refs/remotes/origin/<b>..refs/remotes/upstream/<b>
 git push origin refs/remotes/upstream/<b>:refs/heads/<b>
 git fetch origin
-git merge --ff-only refs/remotes/upstream/<b>                 # if clean and on <b>
+git update-ref refs/heads/<b> <upstream-sha> <old-sha>        # empty worktree
+git merge --ff-only refs/remotes/upstream/<b>                 # populated, clean
 ```
 
 Every invocation runs with `GIT_TERMINAL_PROMPT=0` and is cancelled with the
 run. The push comes straight from the fetched upstream ref, so no working-tree
-checkout is needed to sync; the last `merge --ff-only` is a courtesy that only
-runs when the checkout is on the target branch with nothing uncommitted,
-otherwise the row logs `local checkout not updated (branch/dirty)`.
+checkout is needed to sync — which is what makes the history-only clone above
+enough for git mode. The last step then brings the local clone along:
+
+- nothing checked out (the default clone): the branch ref is moved with
+  `update-ref`, which is given the old sha so a concurrent change makes it fail
+  rather than clobber, and only after `merge-base --is-ancestor` proves it is a
+  fast-forward. The row logs `local branch fast-forwarded (no checkout; run git
+  checkout <b> for files)`.
+- files checked out (a `--full` clone, or you ran `git checkout`): a real
+  `merge --ff-only`, but only when HEAD is on `<b>` with nothing uncommitted.
+  Otherwise the row logs `local checkout not updated (branch/dirty)` and leaves
+  your work alone — the push has already succeeded either way.
 
 If `merge-base --is-ancestor` says the fork has commits of its own, the row is
 reported as `diverged` with the ahead/behind counts and the same resolution

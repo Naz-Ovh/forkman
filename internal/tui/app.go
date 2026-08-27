@@ -277,9 +277,16 @@ func (m appModel) applyEvent(ev sync.Event) appModel {
 	case sync.EvProgress:
 		// Per-repo percentage is reflected in the global bar only.
 	case sync.EvLog:
-		// Same cap the runner puts on Result.Log, so the two stay comparable
-		// at EvDone and a chatty clone cannot grow the model without bound.
-		if ev.Line != "" && len(r.log) < maxRowLog {
+		switch {
+		case ev.Line == "":
+		case ev.Replace && len(r.log) > 0:
+			// git redraws a progress phase in place; show the one line a
+			// terminal would, not one line per percent.
+			r.log[len(r.log)-1] = ev.Line
+		case len(r.log) < maxRowLog:
+			// Same cap the runner puts on Result.Log, so the two stay
+			// comparable at EvDone and a chatty clone cannot grow the model
+			// without bound.
 			r.log = append(r.log, ev.Line)
 		}
 	case sync.EvDone:

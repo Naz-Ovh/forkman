@@ -74,6 +74,11 @@ func logEv(name, line string) eventMsg {
 	return eventMsg{sync.Event{Name: name, Kind: sync.EvLog, Line: line}}
 }
 
+// replaceEv is an EvLog that redraws the line before it, as git's progress does.
+func replaceEv(name, line string) eventMsg {
+	return eventMsg{sync.Event{Name: name, Kind: sync.EvLog, Line: line, Replace: true}}
+}
+
 // expandedLines returns the log lines rendered under row i.
 func expandedLines(m appModel, i int) []string {
 	var out []string
@@ -235,6 +240,44 @@ func TestExpandRunningRowShowsStreamedLines(t *testing.T) {
 	}
 	if n := strings.Count(m.content(), "behind 12 · ahead 0"); n != 1 {
 		t.Errorf("line rendered %d times, want 1 (EvLog then Result.Log duplication)", n)
+	}
+}
+
+// git redraws a progress phase in place, so a row must end up showing one line
+// per phase, not one line per percent.
+func TestReplaceLogLineOverwritesInPlace(t *testing.T) {
+	m := newAppModel(Options{Org: "acme", Plain: true, Tasks: mkTasks("alpha")})
+	m = step(t, m, tea.WindowSizeMsg{Width: 80, Height: 24},
+		startEv("alpha"),
+		logEv("alpha", "git clone acme/alpha"),
+		logEv("alpha", "Receiving objects:   1% (1/3)"),
+		replaceEv("alpha", "Receiving objects:  66% (2/3)"),
+		replaceEv("alpha", "Receiving objects: 100% (3/3), done."),
+		logEv("alpha", "Resolving deltas:  50% (1/2)"),
+		replaceEv("alpha", "Resolving deltas: 100% (2/2), done."),
+		keyEnter,
+	)
+	want := []string{
+		"git clone acme/alpha",
+		"Receiving objects: 100% (3/3), done.",
+		"Resolving deltas: 100% (2/2), done.",
+	}
+	if got := expandedLines(m, 0); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("expanded log =\n%v\nwant\n%v", got, want)
+	}
+	if n := strings.Count(m.content(), "Receiving objects"); n != 1 {
+		t.Errorf("Receiving objects rendered %d times, want 1", n)
+	}
+}
+
+// A replacement with nothing to replace is still a line worth showing.
+func TestReplaceLogLineOnEmptyRowAppends(t *testing.T) {
+	m := newAppModel(Options{Org: "acme", Plain: true, Tasks: mkTasks("alpha")})
+	m = step(t, m, tea.WindowSizeMsg{Width: 80, Height: 24},
+		startEv("alpha"), replaceEv("alpha", "Receiving objects: 100% (3/3), done."), keyEnter,
+	)
+	if got := expandedLines(m, 0); strings.Join(got, "|") != "Receiving objects: 100% (3/3), done." {
+		t.Errorf("expanded log = %v", got)
 	}
 }
 

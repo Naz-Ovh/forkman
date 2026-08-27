@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +17,37 @@ import (
 )
 
 const maxLogLines = 200
+
+// rowLog is one worker's log tail. It applies git's in-place progress updates
+// the way a terminal does: a line marked replace overwrites the previous one,
+// so a phase git redraws once per percent leaves behind only its final state.
+// Lines forkman writes itself are never overwritten.
+type rowLog struct {
+	dst     *[]string
+	gitTail bool // the last kept line came from streamed git output
+}
+
+// add records a line of git's own output.
+func (l *rowLog) add(line string, replace bool) {
+	if replace && l.gitTail && len(*l.dst) > 0 {
+		(*l.dst)[len(*l.dst)-1] = line
+		return
+	}
+	if len(*l.dst) >= maxLogLines {
+		l.gitTail = false // the tail no longer follows git's cursor
+		return
+	}
+	*l.dst = append(*l.dst, line)
+	l.gitTail = true
+}
+
+// step records a line forkman wrote itself, which no progress update replaces.
+func (l *rowLog) step(line string) {
+	if len(*l.dst) < maxLogLines {
+		*l.dst = append(*l.dst, line)
+	}
+	l.gitTail = false
+}
 
 // Runner executes a plan with a bounded worker pool. Workers only ever send
 // Events; they never touch UI state.
@@ -287,11 +319,16 @@ func (r *Runner) doClone(ctx context.Context, t Task, events chan<- Event) Resul
 	existed := clone.IsRepo(dir)
 
 	var mu stdsync.Mutex
-	onLine := func(line string) {
+	log := rowLog{dst: &res.Log}
+	onLine := func(line string, replace bool) {
 		mu.Lock()
-		if len(res.Log) < maxLogLines {
-			res.Log = append(res.Log, line)
-		}
+		log.add(line, replace)
+		mu.Unlock()
+		events <- Event{Name: f.Name, Kind: EvLog, Line: line, Replace: replace}
+	}
+	step := func(line string) {
+		mu.Lock()
+		log.step(line)
 		mu.Unlock()
 		events <- Event{Name: f.Name, Kind: EvLog, Line: line}
 	}
@@ -300,9 +337,9 @@ func (r *Runner) doClone(ctx context.Context, t Task, events chan<- Event) Resul
 	}
 
 	if existed {
-		onLine("already cloned: " + dir)
+		step("already cloned: " + dir)
 	} else {
-		onLine("git clone " + f.NameWithOwner + " → " + dir)
+		step("git clone " + f.NameWithOwner + " → " + dir)
 	}
 	err := clone.Run(ctx, clone.Options{
 		ForkURL:     r.cloneURL(f.NameWithOwner),
@@ -386,11 +423,14 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 
 	// clone.Stream drains git's pipes before it returns, so every callback
 	// happens inside these calls and res needs no locking.
+	log := rowLog{dst: &res.Log}
 	logf := func(line string) {
-		if len(res.Log) < maxLogLines {
-			res.Log = append(res.Log, line)
-		}
+		log.step(line)
 		events <- Event{Name: f.Name, Kind: EvLog, Line: line}
+	}
+	onLine := func(line string, replace bool) {
+		log.add(line, replace)
+		events <- Event{Name: f.Name, Kind: EvLog, Line: line, Replace: replace}
 	}
 	onPercent := func(p float64) {
 		events <- Event{Name: f.Name, Kind: EvProgress, Percent: p}
@@ -412,7 +452,7 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 	} else {
 		logf("git clone " + f.NameWithOwner + " → " + o.Dir)
 	}
-	if err := clone.EnsureClone(ctx, o, logf, onPercent); err != nil {
+	if err := clone.EnsureClone(ctx, o, onLine, onPercent); err != nil {
 		if ctx.Err() != nil {
 			res.Status, res.Detail, res.Err = Failed, interruptedDetail, ctx.Err()
 			return res
@@ -429,7 +469,7 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 	}
 	for _, remote := range []string{"upstream", "origin"} {
 		gitStep(logf, "fetch", remote, "--prune")
-		if err := clone.Stream(ctx, o, logf, onPercent, "fetch", "--progress", remote, "--prune"); err != nil {
+		if err := clone.Stream(ctx, o, onLine, onPercent, "fetch", "--progress", remote, "--prune"); err != nil {
 			if ctx.Err() != nil {
 				res.Status, res.Detail, res.Err = Failed, interruptedDetail, ctx.Err()
 				return res
@@ -478,7 +518,7 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 	// mark is set after the command line so only git's own output is searched
 	// for the rejection reason.
 	mark := len(res.Log)
-	if err := clone.Stream(ctx, o, logf, onPercent, "push", "origin", upRef+":refs/heads/"+forkBranch); err != nil {
+	if err := clone.Stream(ctx, o, onLine, onPercent, "push", "origin", upRef+":refs/heads/"+forkBranch); err != nil {
 		if ctx.Err() != nil {
 			res.Status, res.Detail, res.Err = Failed, interruptedDetail, ctx.Err()
 			return res
@@ -496,7 +536,7 @@ func (r *Runner) doGitSync(ctx context.Context, t Task, events chan<- Event) Res
 	if g := clone.Git(ctx, o, "fetch", "origin"); !g.OK() {
 		logf("fetch origin failed: " + g.Reason())
 	}
-	updateCheckout(ctx, o, forkBranch, upRef, logf)
+	updateLocalBranch(ctx, o, forkBranch, upRef, logf)
 
 	res.Status, res.MergeType = Synced, "fast-forward"
 	res.Commits, res.Behind = n, n
@@ -534,19 +574,77 @@ func revCounts(ctx context.Context, o clone.Options, originRef, upRef string) (a
 	return ahead, behind
 }
 
-// updateCheckout fast-forwards the working tree too, but only when that is
-// safe: on the target branch with nothing uncommitted. Otherwise it just says
-// so, because the push already succeeded.
-func updateCheckout(ctx context.Context, o clone.Options, branch, upRef string, logf func(string)) {
-	head := clone.Git(ctx, o, "rev-parse", "--abbrev-ref", "HEAD")
-	st := clone.Git(ctx, o, "status", "--porcelain")
-	if !head.OK() || !st.OK() || head.Stdout != branch || st.Stdout != "" {
+// updateLocalBranch brings the local clone into line with the upstream ref
+// that was just pushed. A default clone has no working tree at all
+// (--no-checkout), so there is nothing to merge: the branch ref itself is
+// moved, atomically and only forwards. A populated clone still gets a real
+// merge --ff-only, and only when that is safe — on the target branch with
+// nothing uncommitted. Anything else is left alone and said out loud, because
+// the push has already succeeded either way.
+func updateLocalBranch(ctx context.Context, o clone.Options, branch, upRef string, logf func(string)) {
+	head := clone.Git(ctx, o, "symbolic-ref", "--quiet", "HEAD")
+	if !head.OK() || head.Stdout != "refs/heads/"+branch {
+		// Detached HEAD, or parked on another branch.
 		logf("local checkout not updated (branch/dirty)")
 		return
 	}
-	if g := clone.Git(ctx, o, "merge", "--ff-only", upRef); !g.OK() {
-		logf("local checkout not updated: " + g.Reason())
+	if worktreePopulated(ctx, o) {
+		if st := clone.Git(ctx, o, "status", "--porcelain"); !st.OK() || st.Stdout != "" {
+			logf("local checkout not updated (branch/dirty)")
+			return
+		}
+		if g := clone.Git(ctx, o, "merge", "--ff-only", upRef); !g.OK() {
+			logf("local checkout not updated: " + g.Reason())
+			return
+		}
+		logf("local checkout fast-forwarded")
 		return
 	}
-	logf("local checkout fast-forwarded")
+
+	// Nothing is checked out: move the branch ref instead. The old value is
+	// passed to update-ref so a concurrent change makes it fail rather than
+	// clobber, and ancestry is checked so it can only ever fast-forward.
+	ref := "refs/heads/" + branch
+	old := clone.Git(ctx, o, "rev-parse", "--verify", ref)
+	next := clone.Git(ctx, o, "rev-parse", "--verify", upRef)
+	if !old.OK() || !next.OK() {
+		logf("local branch not updated (no " + ref + ")")
+		return
+	}
+	if old.Stdout == next.Stdout {
+		return
+	}
+	if anc := clone.Git(ctx, o, "merge-base", "--is-ancestor", ref, upRef); anc.Code != 0 {
+		logf("local branch not updated (" + branch + " has its own commits)")
+		return
+	}
+	if g := clone.Git(ctx, o, "update-ref", ref, next.Stdout, old.Stdout); !g.OK() {
+		logf("local branch not updated: " + g.Reason())
+		return
+	}
+	logf("local branch fast-forwarded (no checkout; run git checkout " + branch + " for files)")
+}
+
+// worktreePopulated reports whether the clone actually has files. A default
+// --no-checkout clone holds nothing but .git and has an empty index, so
+// git status would call every file deleted and a merge could not run.
+func worktreePopulated(ctx context.Context, o clone.Options) bool {
+	if bare := clone.Git(ctx, o, "rev-parse", "--is-bare-repository"); bare.Stdout != "false" {
+		return false
+	}
+	// Cheap first: a fresh --no-checkout clone is an otherwise empty folder.
+	if ents, err := os.ReadDir(o.Dir); err == nil {
+		empty := true
+		for _, e := range ents {
+			if e.Name() != ".git" {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			return false
+		}
+	}
+	// Files are there, but they may all be untracked; the index decides.
+	return clone.Git(ctx, o, "ls-files").Stdout != ""
 }

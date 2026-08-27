@@ -98,6 +98,11 @@ type Event struct {
 	Kind    EventKind
 	Percent float64
 	Line    string
+	// Replace marks an EvLog line as an in-place update of the previous line
+	// for this repository: git redraws a progress phase with \r, and the
+	// consumer overwrites instead of appending so the row keeps one line per
+	// phase rather than one per percent.
+	Replace bool
 	Result  *Result
 }
 

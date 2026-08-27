@@ -148,7 +148,7 @@ func cmdRun(args []string, kind fsync.Kind) int {
 		mode     *string
 	)
 	if kind == fsync.KindClone {
-		full = fs.Bool("full", false, "full clone instead of --filter=blob:none")
+		full = fs.Bool("full", false, "clone the files too, instead of history only (blob:none, no checkout)")
 	} else {
 		mode = fs.String("mode", "", "sync mode: api (merge-upstream) or git (local clones + push)")
 	}

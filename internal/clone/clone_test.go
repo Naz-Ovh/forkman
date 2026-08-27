@@ -1,32 +1,189 @@
 package clone
 
 import (
-	"bufio"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-func TestSplitLinesCR(t *testing.T) {
-	// git writes progress with \r and normal output with \n.
-	in := "Cloning into 'tempo'...\nReceiving objects:  12% (1/8)\rReceiving objects: 100% (8/8)\rdone.\n"
-	sc := bufio.NewScanner(strings.NewReader(in))
-	sc.Split(splitLinesCR)
-	var got []string
-	for sc.Scan() {
-		got = append(got, sc.Text())
+// progressStream is a phase of git progress exactly as git writes it: updates
+// separated by \r, the final state of each phase terminated by \n.
+const progressStream = "Receiving objects:   1% (1/3)\rReceiving objects:  66% (2/3)\r" +
+	"Receiving objects: 100% (3/3), done.\nResolving deltas:  50% (1/2)\r" +
+	"Resolving deltas: 100% (2/2), done.\n"
+
+// collector is the consumer side of onLine: it applies replace the way the
+// runner and the TUI do.
+type collector struct{ lines []string }
+
+func (c *collector) onLine(line string, replace bool) {
+	if replace && len(c.lines) > 0 {
+		c.lines[len(c.lines)-1] = line
+		return
 	}
+	c.lines = append(c.lines, line)
+}
+
+func TestScanProgressCollapsesInPlaceUpdates(t *testing.T) {
+	var c collector
+	scanProgress(strings.NewReader(progressStream), c.onLine)
 	want := []string{
-		"Cloning into 'tempo'...",
-		"Receiving objects:  12% (1/8)",
-		"Receiving objects: 100% (8/8)",
-		"done.",
+		"Receiving objects: 100% (3/3), done.",
+		"Resolving deltas: 100% (2/2), done.",
+	}
+	if strings.Join(c.lines, "|") != strings.Join(want, "|") {
+		t.Errorf("got %q\nwant %q", c.lines, want)
+	}
+}
+
+func TestScanProgressKeepsFinishedLinesAndMarksUpdates(t *testing.T) {
+	// A normal line, then a phase git redraws, then a plain line again.
+	in := "Cloning into 'tempo'...\nReceiving objects:  12% (1/8)\rReceiving objects: 100% (8/8)\rdone.\nnext\n"
+	type frag struct {
+		line    string
+		replace bool
+	}
+	var got []frag
+	scanProgress(strings.NewReader(in), func(line string, replace bool) {
+		got = append(got, frag{line, replace})
+	})
+	want := []frag{
+		{"Cloning into 'tempo'...", false},
+		{"Receiving objects:  12% (1/8)", false},
+		{"Receiving objects: 100% (8/8)", true},
+		{"done.", true},
+		{"next", false},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("fragment %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// A phase ending in "\r…, done.\n" must not leave a blank line behind, and a
+// trailing \r must not make the next real line overwrite a finished one.
+func TestScanProgressNoEmptyLines(t *testing.T) {
+	var c collector
+	scanProgress(strings.NewReader("first\r\nsecond\n\r\nthird"), c.onLine)
+	if want := "first|second|third"; strings.Join(c.lines, "|") != want {
+		t.Errorf("got %q, want %q", c.lines, want)
+	}
+}
+
+func TestSplitLinesCollapsesProgress(t *testing.T) {
+	got := splitLines(progressStream + "fatal: nope\n")
+	want := []string{
+		"Receiving objects: 100% (3/3), done.",
+		"Resolving deltas: 100% (2/2), done.",
+		"fatal: nope",
 	}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("got %q\nwant %q", got, want)
+	}
+}
+
+// fakeGit writes a shell script standing in for git and returns its path.
+func fakeGit(t *testing.T, body string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "fakegit")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// The whole reader path, from git's pipes to the caller: hundreds of progress
+// updates must arrive as one line per phase.
+func TestRunCollapsesProgressLinesAndReportsPercent(t *testing.T) {
+	bin := fakeGit(t, "printf 'Receiving objects:   1%% (1/3)\\rReceiving objects:  66%% (2/3)\\r"+
+		"Receiving objects: 100%% (3/3), done.\\nResolving deltas:  50%% (1/2)\\r"+
+		"Resolving deltas: 100%% (2/2), done.\\n' >&2\n")
+
+	var c collector
+	var pct []float64
+	err := Run(context.Background(), Options{
+		ForkURL: "https://example.invalid/a.git",
+		Dir:     filepath.Join(t.TempDir(), "target"),
+		Git:     bin,
+	}, c.onLine, func(p float64) { pct = append(pct, p) })
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{
+		"Receiving objects: 100% (3/3), done.",
+		"Resolving deltas: 100% (2/2), done.",
+		historyOnlyLine,
+	}
+	if strings.Join(c.lines, "|") != strings.Join(want, "|") {
+		t.Errorf("streamed lines =\n%q\nwant\n%q", c.lines, want)
+	}
+	// Every update is still reported as progress, in order, per phase.
+	wantPct := []float64{0.01, 0.66, 1, 0.5, 1, 1} // the last 1 is Run finishing
+	if fmt.Sprint(pct) != fmt.Sprint(wantPct) {
+		t.Errorf("percentages = %v, want %v", pct, wantPct)
+	}
+}
+
+// The default clone takes history and nothing else: no blobs, no working tree.
+func TestCloneArgsHistoryOnlyByDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		full    bool
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "default",
+			want: []string{"clone", "--progress", "--filter=blob:none", "--no-checkout"},
+		},
+		{
+			name:    "full",
+			full:    true,
+			want:    []string{"clone", "--progress"},
+			notWant: []string{"--filter=blob:none", "--no-checkout"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argv := filepath.Join(t.TempDir(), "argv")
+			bin := fakeGit(t, "echo \"$@\" >> "+argv+"\n")
+			var c collector
+			if err := EnsureClone(context.Background(), Options{
+				ForkURL: "https://example.invalid/a.git",
+				Dir:     filepath.Join(t.TempDir(), "target"),
+				Git:     bin,
+				Full:    tc.full,
+			}, c.onLine, nil); err != nil {
+				t.Fatalf("EnsureClone: %v", err)
+			}
+			got, err := os.ReadFile(argv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			line := strings.TrimSpace(string(got))
+			for _, w := range tc.want {
+				if !strings.Contains(line, w) {
+					t.Errorf("git args %q lack %q", line, w)
+				}
+			}
+			for _, w := range tc.notWant {
+				if strings.Contains(line, w) {
+					t.Errorf("git args %q contain %q", line, w)
+				}
+			}
+			hasNote := slices.Contains(c.lines, historyOnlyLine)
+			if hasNote == tc.full {
+				t.Errorf("history-only note present = %v, want %v (log %q)", hasNote, !tc.full, c.lines)
+			}
+		})
 	}
 }
 
@@ -81,17 +238,13 @@ func TestRunRejectsEmptyDir(t *testing.T) {
 
 func TestRunUsesInjectedGitAndReportsFailure(t *testing.T) {
 	// A "git" that always fails, so no network or real git is involved.
-	bin := filepath.Join(t.TempDir(), "fakegit")
-	script := "#!/bin/sh\necho 'fatal: could not read Username' >&2\nexit 128\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	bin := fakeGit(t, "echo 'fatal: could not read Username' >&2\nexit 128\n")
 	var lines []string
 	err := Run(context.Background(), Options{
 		ForkURL: "https://example.invalid/a.git",
 		Dir:     filepath.Join(t.TempDir(), "target"),
 		Git:     bin,
-	}, func(l string) { lines = append(lines, l) }, nil)
+	}, func(l string, _ bool) { lines = append(lines, l) }, nil)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -157,11 +310,7 @@ func TestReason(t *testing.T) {
 
 func TestGitCapturesExitStatus(t *testing.T) {
 	// A stand-in for git that exits 1 with a message, so no real git is used.
-	bin := filepath.Join(t.TempDir(), "fakegit")
-	script := "#!/bin/sh\necho stdout-value\necho 'fatal: nope' >&2\nexit 1\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	bin := fakeGit(t, "echo stdout-value\necho 'fatal: nope' >&2\nexit 1\n")
 	g := Git(context.Background(), Options{Git: bin}, "status")
 	if g.OK() || g.Code != 1 {
 		t.Errorf("Code = %d, OK = %v, want 1/false", g.Code, g.OK())

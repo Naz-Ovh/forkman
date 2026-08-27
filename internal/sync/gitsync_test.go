@@ -218,6 +218,96 @@ func TestGitSyncFastForward(t *testing.T) {
 	}
 }
 
+// The default clone shape has no working tree at all, so step 6 moves the
+// branch ref instead of merging into a checkout that does not exist.
+func TestGitSyncNoCheckoutFastForwardsLocalBranch(t *testing.T) {
+	f := newFixture(t)
+	f.advanceUpstream(t, 2)
+	want := f.head(t, f.upstream)
+
+	r := f.runner()
+	r.FullClone = false // history only: --filter=blob:none --no-checkout
+	res := runOne(t, r, f.task())
+	if res.Status != Synced {
+		t.Fatalf("Status = %v (%s), want synced\n%s", res.Status, res.Detail, strings.Join(res.Log, "\n"))
+	}
+	if got := f.head(t, f.origin); got != want {
+		t.Errorf("origin main = %s, want %s", got, want)
+	}
+	// The local branch followed along even though nothing is checked out.
+	if got := gitCmd(t, f.localDir(), "rev-parse", "refs/heads/main"); got != want {
+		t.Errorf("local refs/heads/main = %s, want %s", got, want)
+	}
+	// Still history only: an empty index and a folder holding just .git.
+	if out := gitCmd(t, f.localDir(), "ls-files"); out != "" {
+		t.Errorf("index is populated:\n%s", out)
+	}
+	ents, err := os.ReadDir(f.localDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if e.Name() != ".git" {
+			t.Errorf("working tree file %q; the clone must hold history only", e.Name())
+		}
+	}
+	log := strings.Join(res.Log, "\n")
+	for _, want := range []string{"history only (blob:none, no checkout)", "local branch fast-forwarded"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log does not mention %q:\n%s", want, log)
+		}
+	}
+	// And the files are one checkout away, as the log says.
+	gitCmd(t, f.localDir(), "checkout", "main")
+	if out := gitCmd(t, f.localDir(), "ls-files"); out == "" {
+		t.Error("git checkout main did not populate the working tree")
+	}
+}
+
+// forkman clone leaves history and no files behind, and running it again is a
+// no-op beyond re-wiring and re-fetching the upstream remote.
+func TestCloneIsHistoryOnlyAndIdempotent(t *testing.T) {
+	f := newFixture(t)
+	r := f.runner()
+	r.Kind = KindClone
+	r.GitMode = false
+	r.FullClone = false
+
+	res := runOne(t, r, f.task())
+	if res.Status != Synced || res.Detail != "cloned" {
+		t.Fatalf("Status/Detail = %v/%q, want synced/cloned\n%s", res.Status, res.Detail, strings.Join(res.Log, "\n"))
+	}
+	if !strings.Contains(strings.Join(res.Log, "\n"), "history only (blob:none, no checkout)") {
+		t.Errorf("log does not explain the empty folder:\n%s", strings.Join(res.Log, "\n"))
+	}
+	ents, err := os.ReadDir(f.localDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if e.Name() != ".git" {
+			t.Errorf("working tree file %q; a default clone takes history only", e.Name())
+		}
+	}
+	// History is all there, and upstream is wired up push-disabled.
+	if got := gitCmd(t, f.localDir(), "rev-parse", "refs/remotes/upstream/main"); got != f.head(t, f.upstream) {
+		t.Errorf("upstream/main = %s, want %s", got, f.head(t, f.upstream))
+	}
+	if got := gitCmd(t, f.localDir(), "remote", "get-url", "--push", "upstream"); got != "no_push" {
+		t.Errorf("upstream push url = %q, want no_push", got)
+	}
+	head := gitCmd(t, f.localDir(), "rev-parse", "HEAD")
+
+	// Second run: no re-clone.
+	again := runOne(t, r, f.task())
+	if again.Status != Synced || again.Detail != "already cloned" {
+		t.Errorf("second run = %v/%q, want synced/\"already cloned\"", again.Status, again.Detail)
+	}
+	if got := gitCmd(t, f.localDir(), "rev-parse", "HEAD"); got != head {
+		t.Error("the clone was replaced instead of refreshed")
+	}
+}
+
 func TestGitSyncUpToDate(t *testing.T) {
 	f := newFixture(t)
 	res := runOne(t, f.runner(), f.task())

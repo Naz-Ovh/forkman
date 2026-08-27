@@ -17,14 +17,15 @@ type Writer struct {
 }
 
 type resultLine struct {
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Detail     string `json:"detail"`
-	Commits    int    `json:"commits"`
-	Ahead      int    `json:"ahead"`
-	Behind     int    `json:"behind"`
-	Message    string `json:"message"`
-	DurationMS int64  `json:"duration_ms"`
+	Name       string   `json:"name"`
+	Status     string   `json:"status"`
+	Detail     string   `json:"detail"`
+	Commits    int      `json:"commits"`
+	Ahead      int      `json:"ahead"`
+	Behind     int      `json:"behind"`
+	Message    string   `json:"message"`
+	DurationMS int64    `json:"duration_ms"`
+	Log        []string `json:"log,omitempty"`
 }
 
 type summaryLine struct {
@@ -49,6 +50,7 @@ func (w *Writer) Result(r sync.Result) {
 			Behind:     r.Behind,
 			Message:    r.Message,
 			DurationMS: r.Duration.Milliseconds(),
+			Log:        r.Log,
 		})
 		return
 	}

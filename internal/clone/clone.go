@@ -26,6 +26,9 @@ type Options struct {
 	Git         string // git binary, defaults to "git"
 }
 
+// historyOnlyLine explains the empty folder a default clone leaves behind.
+const historyOnlyLine = "history only (blob:none, no checkout)"
+
 // IsRepo reports whether dir already holds a git working tree.
 func IsRepo(dir string) bool {
 	if dir == "" {
@@ -43,8 +46,10 @@ func IsRepo(dir string) bool {
 
 // Run clones the fork if needed, then makes sure the upstream remote exists,
 // is push-disabled, and is fetched. Every line git prints is handed to onLine
-// and every progress percentage to onPercent.
-func Run(ctx context.Context, o Options, onLine func(string), onPercent func(float64)) error {
+// and every progress percentage to onPercent. onLine's replace argument is
+// true when the line is an in-place update of the line before it, exactly as
+// a terminal would redraw it (see scanProgress).
+func Run(ctx context.Context, o Options, onLine func(line string, replace bool), onPercent func(float64)) error {
 	onLine, onPercent = callbacks(onLine, onPercent)
 	if err := EnsureClone(ctx, o, onLine, onPercent); err != nil {
 		return err
@@ -61,7 +66,7 @@ func Run(ctx context.Context, o Options, onLine func(string), onPercent func(flo
 // EnsureClone clones o.Dir from o.ForkURL when it is missing, then makes the
 // upstream remote exist, point at o.UpstreamURL and refuse pushes. It is
 // idempotent and does not fetch.
-func EnsureClone(ctx context.Context, o Options, onLine func(string), onPercent func(float64)) error {
+func EnsureClone(ctx context.Context, o Options, onLine func(line string, replace bool), onPercent func(float64)) error {
 	if o.Dir == "" {
 		return fmt.Errorf("clone: empty target directory")
 	}
@@ -73,15 +78,20 @@ func EnsureClone(ctx context.Context, o Options, onLine func(string), onPercent 
 		}
 		args := []string{"clone", "--progress"}
 		if !o.Full {
-			args = append(args, "--filter=blob:none")
+			// History without file contents: no blobs are downloaded and
+			// nothing is checked out, so the folder holds only .git.
+			args = append(args, "--filter=blob:none", "--no-checkout")
 		}
 		args = append(args, o.ForkURL, o.Dir)
 		// The clone itself runs outside the target directory.
 		if err := run(ctx, gitBin(o), "", args, onLine, onPercent); err != nil {
 			return err
 		}
+		if !o.Full {
+			onLine(historyOnlyLine, false)
+		}
 	} else {
-		onLine("already cloned; refreshing upstream")
+		onLine("already cloned; refreshing upstream", false)
 	}
 
 	if o.UpstreamURL == "" {
@@ -98,7 +108,7 @@ func EnsureClone(ctx context.Context, o Options, onLine func(string), onPercent 
 
 // Stream runs one git subcommand in o.Dir, forwarding every output line to
 // onLine and every progress percentage to onPercent.
-func Stream(ctx context.Context, o Options, onLine func(string), onPercent func(float64), args ...string) error {
+func Stream(ctx context.Context, o Options, onLine func(line string, replace bool), onPercent func(float64), args ...string) error {
 	onLine, onPercent = callbacks(onLine, onPercent)
 	return run(ctx, gitBin(o), o.Dir, args, onLine, onPercent)
 }
@@ -187,13 +197,21 @@ func cut(line, prefix string) (string, bool) {
 	return strings.TrimSpace(strings.TrimPrefix(line, prefix)), true
 }
 
+// splitLines turns captured output into the lines a terminal would have been
+// left showing: an \r-separated progress phase collapses to its final state.
 func splitLines(s string) []string {
 	var out []string
-	for l := range strings.FieldsFuncSeq(s, func(r rune) bool { return r == '\n' || r == '\r' }) {
-		if l = strings.TrimSpace(l); l != "" {
-			out = append(out, l)
+	scanProgress(strings.NewReader(s), func(line string, replace bool) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return
 		}
-	}
+		if replace && len(out) > 0 {
+			out[len(out)-1] = line
+			return
+		}
+		out = append(out, line)
+	})
 	return out
 }
 
@@ -208,9 +226,9 @@ func gitEnv() []string {
 	return append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "GCM_INTERACTIVE=never")
 }
 
-func callbacks(onLine func(string), onPercent func(float64)) (func(string), func(float64)) {
+func callbacks(onLine func(string, bool), onPercent func(float64)) (func(string, bool), func(float64)) {
 	if onLine == nil {
-		onLine = func(string) {}
+		onLine = func(string, bool) {}
 	}
 	if onPercent == nil {
 		onPercent = func(float64) {}
@@ -220,7 +238,7 @@ func callbacks(onLine func(string), onPercent func(float64)) (func(string), func
 
 var percentRe = regexp.MustCompile(`(?:Receiving objects|Resolving deltas|Updating files|Counting objects|Compressing objects):\s+(\d{1,3})%`)
 
-func run(ctx context.Context, git, dir string, args []string, onLine func(string), onPercent func(float64)) error {
+func run(ctx context.Context, git, dir string, args []string, onLine func(string, bool), onPercent func(float64)) error {
 	cmd := exec.CommandContext(ctx, git, args...)
 	cmd.Dir = dir
 	cmd.Env = gitEnv()
@@ -242,24 +260,17 @@ func run(ctx context.Context, git, dir string, args []string, onLine func(string
 	done := make(chan struct{}, 2)
 	consume := func(r io.Reader) {
 		defer func() { done <- struct{}{} }()
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-		sc.Split(splitLinesCR)
-		for sc.Scan() {
-			line := strings.TrimRight(sc.Text(), " \t")
-			if line == "" {
-				continue
-			}
+		scanProgress(r, func(line string, replace bool) {
 			mu.Lock()
+			defer mu.Unlock()
 			if m := percentRe.FindStringSubmatch(line); m != nil {
 				if n, cerr := strconv.Atoi(m[1]); cerr == nil {
 					onPercent(float64(n) / 100)
 				}
 			}
 			tail.add(line)
-			onLine(line)
-			mu.Unlock()
-		}
+			onLine(line, replace)
+		})
 	}
 	go consume(out)
 	go consume(errPipe)
@@ -275,18 +286,50 @@ func run(ctx context.Context, git, dir string, args []string, onLine func(string
 	return nil
 }
 
-// splitLinesCR splits on \n and \r, which is how git emits progress updates.
+// splitLinesCR splits on \n and \r, which is how git emits progress updates,
+// and keeps the terminator so the caller can tell the two apart.
 func splitLinesCR(data []byte, atEOF bool) (int, []byte, error) {
 	if atEOF && len(data) == 0 {
 		return 0, nil, nil
 	}
 	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-		return i + 1, data[:i], nil
+		return i + 1, data[:i+1], nil
 	}
 	if atEOF {
 		return len(data), data, nil
 	}
 	return 0, nil, nil
+}
+
+// scanProgress reads git's output the way a terminal draws it. git separates
+// progress updates with \r, which leaves the cursor on the same line: the next
+// fragment overwrites what is already there. Only \n finishes a line. Each
+// fragment is reported with replace=true when it overwrites the fragment
+// before it, so a hundred "Receiving objects: NN%" updates collapse back into
+// the single line a user would have seen.
+func scanProgress(r io.Reader, emit func(line string, replace bool)) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	sc.Split(splitLinesCR)
+	overwrites := false
+	for sc.Scan() {
+		raw := sc.Bytes()
+		var term byte
+		if n := len(raw); n > 0 && (raw[n-1] == '\r' || raw[n-1] == '\n') {
+			term, raw = raw[n-1], raw[:n-1]
+		}
+		line := strings.TrimRight(string(raw), " \t")
+		if line == "" {
+			// A bare \n still finishes the line the cursor sits on; this is
+			// what keeps git's "\r…, done.\n" from adding an empty line.
+			if term == '\n' {
+				overwrites = false
+			}
+			continue
+		}
+		emit(line, overwrites)
+		overwrites = term == '\r'
+	}
 }
 
 // lineTail keeps the most recent non-progress line for error messages.
