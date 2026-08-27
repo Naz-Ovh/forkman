@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sort"
 
-	"forkman/internal/config"
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 // writable permissions that allow pushing to the fork, whether the push goes

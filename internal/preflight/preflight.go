@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"forkman/internal/config"
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 // Exit codes owned by preflight.

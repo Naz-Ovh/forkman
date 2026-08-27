@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	sync "forkman/internal/sync"
+	sync "github.com/naz-ovh/forkman/internal/sync"
 )
 
 // Writer emits one line per repository, either aligned text or JSON.

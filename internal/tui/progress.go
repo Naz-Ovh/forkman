@@ -10,7 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"forkman/internal/sync"
+	"github.com/naz-ovh/forkman/internal/sync"
 )
 
 // bar wraps bubbles/progress. In plain mode the bubble is bypassed at render

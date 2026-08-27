@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"forkman/internal/config"
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 func env(m map[string]string) func(string) string {

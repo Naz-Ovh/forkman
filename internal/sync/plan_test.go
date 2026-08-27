@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"forkman/internal/config"
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 func fork(name string, mut ...func(*github.Fork)) github.Fork {

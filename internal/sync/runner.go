@@ -11,9 +11,9 @@ import (
 	stdsync "sync"
 	"time"
 
-	"forkman/internal/clone"
-	"forkman/internal/config"
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/clone"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 const maxLogLines = 200

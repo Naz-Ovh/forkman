@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"forkman/internal/config"
-	fsync "forkman/internal/sync"
+	"github.com/naz-ovh/forkman/internal/config"
+	fsync "github.com/naz-ovh/forkman/internal/sync"
 )
 
 // capture runs fn with stdout and stderr redirected, returning its exit code

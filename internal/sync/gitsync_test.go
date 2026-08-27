@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"forkman/internal/config"
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 // requireGit skips a test when git is unavailable.

@@ -5,7 +5,7 @@ package sync
 import (
 	"time"
 
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 // Status is the terminal (or in-flight) state of one repository.

@@ -11,21 +11,40 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
-	"forkman/internal/config"
-	"forkman/internal/github"
-	"forkman/internal/plain"
-	"forkman/internal/preflight"
-	fsync "forkman/internal/sync"
-	"forkman/internal/tui"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/plain"
+	"github.com/naz-ovh/forkman/internal/preflight"
+	fsync "github.com/naz-ovh/forkman/internal/sync"
+	"github.com/naz-ovh/forkman/internal/tui"
 )
 
-// version is overridden at build time via -ldflags -X main.version=...
+// version is overridden at build time via -ldflags -X main.version=... It must
+// stay initialised to a constant string: the linker's -X only rewrites string
+// variables that are uninitialised or set to a constant expression.
 var version = "dev"
+
+// init recovers a version for binaries the linker never stamped. `go install
+// <module>/cmd/forkman@vX.Y.Z` cannot pass ldflags, but the toolchain records
+// the module version in the build info, so read it back from there.
+func init() {
+	if version != "dev" {
+		return
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	if v := bi.Main.Version; v != "" && v != "(devel)" {
+		version = v
+	}
+}
 
 // exit codes not owned by other packages
 const (

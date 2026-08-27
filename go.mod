@@ -1,4 +1,4 @@
-module forkman
+module github.com/naz-ovh/forkman
 
 go 1.27.0
 

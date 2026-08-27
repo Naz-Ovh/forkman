@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	sync "forkman/internal/sync"
+	sync "github.com/naz-ovh/forkman/internal/sync"
 )
 
 func TestResultText(t *testing.T) {

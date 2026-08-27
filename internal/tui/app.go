@@ -10,7 +10,7 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 
-	"forkman/internal/sync"
+	"github.com/naz-ovh/forkman/internal/sync"
 )
 
 // Options configures the run-time TUI. Workers never touch the model; they

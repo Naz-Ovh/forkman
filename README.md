@@ -10,15 +10,32 @@ else is the Go standard library — the GitHub client is hand-rolled on
 
 ## Install
 
-With [bin](https://github.com/marcosnils/bin) (recommended — tracks GitHub releases and updates in place):
+With the Go toolchain (recommended — no extra tooling, and it builds from the
+tagged source you can read):
+
+```sh
+go install github.com/naz-ovh/forkman/cmd/forkman@latest
+go install github.com/naz-ovh/forkman/cmd/forkman@v0.1.1   # or pin a release
+```
+
+The binary lands in `$(go env GOPATH)/bin`, so make sure that is on your `PATH`.
+Any Go 1.21 or newer toolchain works: the `go 1.27.0` line in `go.mod` makes it
+fetch Go 1.27 on its own. Installed this way `forkman --version` reports the
+module version, which the toolchain records in the build info.
+
+`go install` needs v0.1.1 or newer. v0.1.0 was published before the module path
+was corrected, and the Go module proxy's copy of a version is immutable, so that
+one tag can only be installed from a release archive or from source.
+
+From a release archive: download `forkman_<version>_<os>_<arch>.tar.gz` (or `.zip` on Windows) from the
+[releases page](https://github.com/naz-ovh/forkman/releases), verify against `checksums.txt`, and put `forkman` on your `PATH`.
+
+With [bin](https://github.com/marcosnils/bin), if you already use it to track GitHub releases and update in place:
 
 ```sh
 bin install github.com/naz-ovh/forkman
 bin update forkman        # later
 ```
-
-From a release archive: download `forkman_<version>_<os>_<arch>.tar.gz` (or `.zip` on Windows) from the
-[releases page](https://github.com/naz-ovh/forkman/releases), verify against `checksums.txt`, and put `forkman` on your `PATH`.
 
 From source:
 

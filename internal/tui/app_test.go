@@ -11,8 +11,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"forkman/internal/github"
-	"forkman/internal/sync"
+	"github.com/naz-ovh/forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/sync"
 )
 
 var updateGolden = flag.Bool("update", false, "update golden files")

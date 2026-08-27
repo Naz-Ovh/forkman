@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"forkman/internal/config"
-	"forkman/internal/github"
+	"github.com/naz-ovh/forkman/internal/config"
+	"github.com/naz-ovh/forkman/internal/github"
 )
 
 // forkServer serves compare and merge-upstream per repository name.
