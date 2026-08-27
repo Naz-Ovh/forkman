@@ -25,29 +25,104 @@ type Options struct {
 	Plain         bool
 	Version       string
 	ScopesKnown   bool
+
+	// Prepare runs the pre-run work — the preflight checks and fork discovery
+	// — from inside the alt screen, reporting each step as it goes so the
+	// seconds it takes are visible instead of silent. When it is set the
+	// program opens on the startup checklist and the plan comes back from
+	// Prepare rather than from Tasks.
+	Prepare func(ctx context.Context, report func(Step)) (*Prepared, error)
+
+	// Confirm persists the exclusions chosen in the selector and returns the
+	// re-planned tasks.
+	Confirm func(excluded []string) ([]sync.Task, error)
+
+	// Start launches the runner for tasks and returns the channel it publishes
+	// on. A nil Start means there is no work to watch, so the program ends once
+	// Prepare (and the selector, when it is shown) is done: that is what
+	// --dry-run and `forkman configure` want.
+	Start func(tasks []sync.Task) <-chan sync.Event
+
+	// Now is the clock the startup timings are measured against. Tests set it.
+	Now func() time.Time
 }
 
-// Run drives the Work → Summary program and returns the collected results.
-func Run(ctx context.Context, o Options) ([]sync.Result, bool, error) {
-	p := tea.NewProgram(newAppModel(o),
+// Prepared is what Prepare produced: the plan, plus whatever the views need
+// that is only known once GitHub has been asked.
+type Prepared struct {
+	Tasks []sync.Task
+
+	// NeedSelect asks for the exclusion selector before anything runs.
+	NeedSelect  bool
+	Items       []SelectorItem
+	Preselected []string
+
+	RateRemaining func() int
+	ScopesKnown   bool
+}
+
+// Outcome is what a run produced. Err carries a failure from Prepare or
+// Confirm: the program leaves the alt screen without reporting it, so the
+// caller can print it on the normal screen and pick the exit code.
+type Outcome struct {
+	Tasks       []sync.Task
+	Excluded    []string
+	Results     []sync.Result
+	Interrupted bool
+	Cancelled   bool
+	Err         error
+}
+
+// Run drives the Startup → Select → Work → Summary program.
+func Run(ctx context.Context, o Options) (Outcome, error) {
+	// Prepare runs under a context this function owns, so quitting the program
+	// aborts a request in flight instead of waiting it out.
+	pctx, cancelPrepare := context.WithCancel(ctx)
+	defer cancelPrepare()
+
+	m := newAppModel(o)
+	if o.Prepare != nil {
+		steps := make(chan Step, 64)
+		m.steps = steps
+		m.cancelPrepare = cancelPrepare
+		m.runPrepare = func() tea.Msg {
+			// Closing the channel is what stops the model waiting for steps.
+			defer close(steps)
+			p, err := o.Prepare(pctx, func(s Step) {
+				select {
+				case steps <- s:
+				case <-pctx.Done():
+				}
+			})
+			return preparedMsg{p: p, err: err}
+		}
+	}
+
+	p := tea.NewProgram(m,
 		tea.WithContext(ctx),
 		tea.WithoutSignalHandler(),
 		tea.WithFPS(30),
 	)
 	final, err := p.Run()
-	interrupted := false
+	var out Outcome
 	if err != nil {
 		if errors.Is(err, tea.ErrInterrupted) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			interrupted = true
+			out.Interrupted = true
 		} else {
-			return nil, false, err
+			return out, err
 		}
 	}
-	m, ok := final.(appModel)
+	fm, ok := final.(appModel)
 	if !ok {
-		return nil, interrupted, nil
+		return out, nil
 	}
-	return m.collect(), interrupted || m.interrupted, nil
+	out.Tasks = fm.tasks
+	out.Excluded = fm.excluded
+	out.Results = fm.collect()
+	out.Interrupted = out.Interrupted || fm.interrupted
+	out.Cancelled = fm.cancelled
+	out.Err = fm.fail
+	return out, nil
 }
 
 type appState int
@@ -56,10 +131,20 @@ const (
 	stateWork appState = iota
 	stateCancelling
 	stateSummary
+	// stateStartup and stateSelect come before the work view when Prepare is
+	// set. They are listed last so the zero value stays stateWork.
+	stateStartup
+	stateSelect
 )
 
 type eventMsg struct{ ev sync.Event }
 type eventsClosedMsg struct{}
+type stepMsg struct{ step Step }
+type stepsClosedMsg struct{}
+type preparedMsg struct {
+	p   *Prepared
+	err error
+}
 
 // waitForEvent reads exactly one event so the model stays single-threaded.
 func waitForEvent(ch <-chan sync.Event) tea.Cmd {
@@ -72,6 +157,21 @@ func waitForEvent(ch <-chan sync.Event) tea.Cmd {
 			return eventsClosedMsg{}
 		}
 		return eventMsg{ev}
+	}
+}
+
+// waitForStep reads exactly one startup report, the same way waitForEvent
+// reads one run event.
+func waitForStep(ch <-chan Step) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		s, ok := <-ch
+		if !ok {
+			return stepsClosedMsg{}
+		}
+		return stepMsg{s}
 	}
 }
 
@@ -109,36 +209,77 @@ type appModel struct {
 	bar         bar
 	rate        int
 	interrupted bool
+
+	// startup and selector phases
+	tasks         []sync.Task
+	excluded      []string
+	startup       startup
+	sel           selectorModel
+	steps         <-chan Step
+	runPrepare    tea.Cmd
+	cancelPrepare context.CancelFunc
+	clock         func() time.Time
+	now           time.Time
+	fail          error
+	cancelled     bool
 }
 
 func newAppModel(o Options) appModel {
 	th := NewTheme(o.Plain)
-	rows := make([]row, 0, len(o.Tasks))
-	index := make(map[string]int, len(o.Tasks))
-	for _, t := range o.Tasks {
-		index[t.Fork.Name] = len(rows)
-		rows = append(rows, row{name: t.Fork.Name, status: sync.Pending})
+	clock := o.Now
+	if clock == nil {
+		clock = time.Now
 	}
-	return appModel{
+	now := clock()
+	m := appModel{
 		o:     o,
 		th:    th,
-		rows:  rows,
-		index: index,
 		sp:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(th.Info)),
 		bar:   newBar(th),
 		rate:  -1,
+		clock: clock,
+		now:   now,
 	}
+	m.setTasks(o.Tasks)
+	if o.Prepare != nil {
+		m.state = stateStartup
+		m.startup = newStartup(th, now)
+	}
+	return m
+}
+
+// setTasks makes tasks the plan, rebuilding the rows that are THE display
+// order for the run.
+func (m *appModel) setTasks(tasks []sync.Task) {
+	m.tasks = tasks
+	m.rows = make([]row, 0, len(tasks))
+	m.index = make(map[string]int, len(tasks))
+	for _, t := range tasks {
+		m.index[t.Fork.Name] = len(m.rows)
+		m.rows = append(m.rows, row{name: t.Fork.Name, status: sync.Pending})
+	}
+	m.cursor, m.top = 0, 0
 }
 
 func (m appModel) Init() tea.Cmd {
+	if m.state == stateStartup {
+		return tea.Batch(m.sp.Tick, m.runPrepare, waitForStep(m.steps))
+	}
 	return tea.Batch(m.sp.Tick, waitForEvent(m.o.Events))
 }
 
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Every message is a chance to advance the clock the startup timings are
+	// measured against.
+	m.now = m.clock()
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.bar.setWidth(m.barWidth())
+		if m.state == stateSelect {
+			m.sel.resize(msg.Width, msg.Height)
+		}
 		m.ensureVisible()
 		return m, nil
 
@@ -170,15 +311,102 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.autoExpandFirstFailure()
 		m.ensureVisible()
 		return m, nil
+
+	case stepMsg:
+		if m.state != stateStartup {
+			return m, nil
+		}
+		m.startup.apply(msg.step, m.now)
+		return m, waitForStep(m.steps)
+
+	case stepsClosedMsg:
+		// Prepare has returned; its own message carries the result.
+		return m, nil
+
+	case preparedMsg:
+		return m.applyPrepared(msg)
 	}
 
+	if m.state == stateSelect {
+		return m.updateSelector(msg)
+	}
 	if cmd := m.bar.update(msg); cmd != nil {
 		return m, cmd
 	}
 	return m, nil
 }
 
+// applyPrepared takes over from the startup checklist: it shows the selector
+// on a first run, and otherwise starts the work.
+func (m appModel) applyPrepared(msg preparedMsg) (tea.Model, tea.Cmd) {
+	if m.cancelled {
+		// Prepare was cancelled by the keypress that is already quitting, so
+		// whatever it returned is a consequence, not a failure to report.
+		return m, tea.Quit
+	}
+	if msg.err != nil {
+		m.fail = msg.err
+		return m, tea.Quit
+	}
+	p := msg.p
+	if p == nil {
+		m.fail = errors.New("nothing prepared")
+		return m, tea.Quit
+	}
+	if p.RateRemaining != nil {
+		m.o.RateRemaining = p.RateRemaining
+	}
+	m.o.ScopesKnown = p.ScopesKnown
+	m.setTasks(p.Tasks)
+	m.startup.finish(m.now)
+	if p.NeedSelect {
+		m.sel = newSelectorModel(m.o.Org, p.Items, p.Preselected, m.th)
+		m.sel.resize(m.width, m.height)
+		m.state = stateSelect
+		return m, nil
+	}
+	return m.beginWork()
+}
+
+// beginWork starts the runner and switches to the work view. With no runner to
+// start there is nothing left to watch, so the program ends.
+func (m appModel) beginWork() (tea.Model, tea.Cmd) {
+	if m.o.Start == nil {
+		return m, tea.Quit
+	}
+	m.o.Events = m.o.Start(m.tasks)
+	m.state = stateWork
+	m.bar.setWidth(m.barWidth())
+	return m, tea.Batch(waitForEvent(m.o.Events), m.bar.setPercent(m.fraction()))
+}
+
+// updateSelector forwards a message the embedded selector owns, such as the
+// filter input's cursor blink.
+func (m appModel) updateSelector(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.sel.Update(msg)
+	if sel, ok := next.(selectorModel); ok {
+		m.sel = sel
+	}
+	return m, cmd
+}
+
 func (m appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch m.state {
+	case stateStartup:
+		switch msg.String() {
+		case "q", "esc", "ctrl+c":
+			m.cancelled = true
+			m.interrupted = msg.String() == "ctrl+c"
+			if m.cancelPrepare != nil {
+				m.cancelPrepare()
+			}
+			return m, tea.Quit
+		}
+		return m, nil
+	case stateSelect:
+		return m.selectorKey(msg)
+	}
+
 	switch msg.String() {
 	case "up", "k":
 		if m.cursor > 0 {
@@ -226,6 +454,35 @@ func (m appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// selectorKey drives the embedded selector. Its own enter and esc handling
+// sets done or cancelled, which the program acts on instead of quitting.
+func (m appModel) selectorKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	next, cmd := m.sel.Update(msg)
+	sel, ok := next.(selectorModel)
+	if !ok {
+		return m, cmd
+	}
+	m.sel = sel
+	switch {
+	case sel.cancelled:
+		m.cancelled = true
+		m.interrupted = msg.String() == "ctrl+c"
+		return m, tea.Quit
+	case sel.done:
+		m.excluded = sel.selected()
+		if m.o.Confirm != nil {
+			tasks, err := m.o.Confirm(m.excluded)
+			if err != nil {
+				m.fail = err
+				return m, tea.Quit
+			}
+			m.setTasks(tasks)
+		}
+		return m.beginWork()
+	}
+	return m, cmd
 }
 
 // toggle expands or collapses any row. Rows that have produced no output yet
@@ -497,6 +754,10 @@ func (m appModel) headerLines() []string {
 	if n := m.failedCount(); n > 0 {
 		stats += fmt.Sprintf(" · %d failed", n)
 	}
+	// Startup scrolls past in a second; its cost stays worth knowing.
+	if m.startup.took > 0 {
+		stats = "prep " + formatDur(m.startup.took) + " · " + stats
+	}
 	head := lr("  "+th.Title.Render(trunc(title, w-4)), th.Muted.Render(stats), w-2)
 	barLine := "  " + m.bar.view(m.fraction()) + " " + th.Muted.Render(percentText(m.fraction()))
 	return []string{head, trunc(barLine, w), ""}
@@ -550,7 +811,41 @@ func (m appModel) footerLines() []string {
 	return []string{"", line}
 }
 
+// startupContent is the checklist shown while Prepare runs: one line per
+// step, each with what it is doing and how long it has taken.
+func (m appModel) startupContent() string {
+	w, h := m.w(), m.h()
+	head := []string{
+		lr("  "+m.th.Title.Render(trunc("Preparing "+m.o.Org, w-12)),
+			m.th.Muted.Render(formatDur(m.startup.elapsed(m.now))), w-2),
+		"",
+	}
+	foot := []string{"", "  " + m.th.Muted.Render(fitKeys(w-4, "esc cancel", "esc"))}
+	body := m.startup.view(w, m.now, m.sp.View())
+
+	out := make([]string, 0, h)
+	out = append(out, head...)
+	for i := 0; i < h-len(head)-len(foot); i++ {
+		if i < len(body) {
+			out = append(out, body[i])
+		} else {
+			out = append(out, "")
+		}
+	}
+	out = append(out, foot...)
+	if len(out) > h {
+		out = out[:h]
+	}
+	return strings.Join(out, "\n")
+}
+
 func (m appModel) content() string {
+	switch m.state {
+	case stateStartup:
+		return m.startupContent()
+	case stateSelect:
+		return m.sel.content()
+	}
 	head := m.headerLines()
 	foot := m.footerLines()
 	vh := m.viewportHeight()

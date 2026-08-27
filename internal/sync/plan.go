@@ -32,6 +32,10 @@ func Plan(forks []github.Fork, cfg *config.Config, kind Kind) []Task {
 			t.skip("excluded by config",
 				fmt.Sprintf("excluded by config pattern %q", pattern),
 				"put it back with: forkman configure --exclude-remove "+f.Name)
+		case f.Unresolved:
+			t.skip("detail unavailable",
+				"GitHub did not return this repository's branch and parent detail",
+				"it was probably renamed or removed mid-run; try again")
 		case f.Archived:
 			t.skip("archived", "archived repositories cannot be pushed to")
 		case !f.HasParent:

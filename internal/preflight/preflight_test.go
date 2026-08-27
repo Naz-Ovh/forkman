@@ -542,3 +542,59 @@ func TestRunAPIModeIgnoresProtocolAndCloneDir(t *testing.T) {
 		}
 	}
 }
+
+func TestRunReportsEachCheckAsItStartsAndFinishes(t *testing.T) {
+	var log []string
+	res, fail := Run(context.Background(), Options{
+		NeedGit:  true,
+		Org:      "acme",
+		Client:   newStub(t, &apiStub{scopes: "repo, workflow"}),
+		LookPath: lookPathOK,
+		Getenv:   env(map[string]string{"FORKMAN_TOKEN": "t"}),
+		Begin:    func(name string) { log = append(log, "begin "+name) },
+		Done:     func(c Check) { log = append(log, "done "+c.Name) },
+	})
+	if fail != nil {
+		t.Fatalf("unexpected failure: %+v", fail)
+	}
+	// Every check is announced before it runs and again when it lands, in the
+	// order Run performs them: that pairing is what times each step on screen.
+	want := []string{
+		"begin git on PATH", "done git on PATH",
+		"begin token", "done token",
+		"begin authentication", "done authentication",
+		"begin scopes", "done scopes",
+		"begin organization", "done organization",
+	}
+	if strings.Join(log, ",") != strings.Join(want, ",") {
+		t.Errorf("progress = %v\nwant %v", log, want)
+	}
+	if len(res.Checks) != 5 {
+		t.Errorf("%d checks recorded, want 5", len(res.Checks))
+	}
+}
+
+func TestRunReportsTheCheckThatFailed(t *testing.T) {
+	var failed []Check
+	_, fail := Run(context.Background(), Options{
+		Org:    "acme",
+		Getenv: env(nil),
+		GHToken: func(context.Context) (string, error) {
+			return "", errors.New("gh: not logged in")
+		},
+		Done: func(c Check) {
+			if !c.OK {
+				failed = append(failed, c)
+			}
+		},
+	})
+	if fail == nil {
+		t.Fatal("expected a failure with no token available")
+	}
+	if len(failed) != 1 || failed[0].Name != checkToken {
+		t.Fatalf("reported failures = %+v, want just the token check", failed)
+	}
+	if failed[0].Fix == "" {
+		t.Error("the reported check carries no fix")
+	}
+}

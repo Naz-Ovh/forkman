@@ -253,3 +253,25 @@ func TestSummarizeAndExitCode(t *testing.T) {
 		t.Errorf("ExitCode(diverged) = %d, want 6", got)
 	}
 }
+
+func TestPlanSkipsUnresolvedForks(t *testing.T) {
+	// Discovery could not read this fork's branch and parent, so nothing can
+	// be planned for it — and saying "not a fork" would be a lie.
+	f := fork("vanished", func(f *github.Fork) {
+		f.Unresolved, f.HasParent, f.DefaultBranch, f.HeadOID = true, false, "", ""
+	})
+	for _, kind := range []Kind{KindSync, KindClone} {
+		task := Plan([]github.Fork{f}, &config.Config{}, kind)[0]
+		if !task.Skip || task.SkipReason != "detail unavailable" {
+			t.Errorf("kind %v: task = %+v, want skipped as \"detail unavailable\"", kind, task)
+		}
+		if len(task.Log) == 0 || !strings.Contains(strings.Join(task.Log, " "), "renamed or removed") {
+			t.Errorf("kind %v: log = %v, want it to explain what happened", kind, task.Log)
+		}
+	}
+	// Exclusion still wins: the user asked not to hear about it at all.
+	cfg := &config.Config{Excluded: []string{"vanished"}}
+	if got := Plan([]github.Fork{f}, cfg, KindSync)[0].SkipReason; got != "excluded by config" {
+		t.Errorf("SkipReason = %q, want %q", got, "excluded by config")
+	}
+}

@@ -201,6 +201,15 @@ The token is never printed, logged or included in any error.
 Output falls back to one line per repository when stdout is not a TTY, or with
 `--plain`; `--json` emits one JSON object per line.
 
+Nothing happens off screen: the full-screen view opens straight away and runs
+the preflight checks and fork discovery inside it, one checklist line per step
+with the time each one took, so a slow `gh auth token` or a slow organization is
+visible rather than a blank terminal. Discovery itself is two GraphQL phases —
+the fork list, then each fork's default branch and upstream parent, fetched in
+concurrent batches, which is the part GitHub spends seconds on. `--plain` prints
+the same steps to stderr when stderr is a terminal, and nothing when it is a
+pipe. `esc` cancels while the checklist is up.
+
 | Variable | Effect |
 | --- | --- |
 | `NO_COLOR` | non-empty disables colour |

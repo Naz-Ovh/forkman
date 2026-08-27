@@ -100,11 +100,11 @@ func TestSelectorSelectionPersistsAcrossFilterChanges(t *testing.T) {
 	}
 
 	// enter confirms; the model reports the sorted selection.
-	m2, cmd := m.Update(keyEnter)
-	if cmd == nil {
-		t.Fatal("enter must quit the selector")
-	}
+	m2, _ := m.Update(keyEnter)
 	sm := m2.(selectorModel)
+	if !sm.done {
+		t.Fatal("enter must mark the selector done")
+	}
 	if sm.cancelled {
 		t.Fatal("enter must not cancel")
 	}
@@ -117,11 +117,12 @@ func TestSelectorEscCancels(t *testing.T) {
 	m := newSelectorModel("0x-fork", mkItems("a", "b"), []string{"a"}, NewTheme(true))
 	m = step(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m2, cmd := m.Update(keyEsc)
-	if cmd == nil {
-		t.Fatal("esc must quit")
+	if cmd != nil {
+		t.Fatal("the selector must not quit the program itself; its host decides")
 	}
-	if !m2.(selectorModel).cancelled {
-		t.Fatal("esc must mark the selector cancelled")
+	sm := m2.(selectorModel)
+	if !sm.cancelled || sm.done {
+		t.Fatalf("esc must mark the selector cancelled, not done: %+v", sm)
 	}
 }
 

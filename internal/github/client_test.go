@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -368,52 +370,146 @@ func TestGetOrgNotFound(t *testing.T) {
 	}
 }
 
-func TestListForksPaginates(t *testing.T) {
-	var cursors []any
-	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/graphql" {
-			t.Errorf("path = %s, want /graphql", r.URL.Path)
-		}
-		var req struct {
-			Query     string         `json:"query"`
-			Variables map[string]any `json:"variables"`
-		}
-		if err := decodeJSON(r, &req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if !strings.Contains(req.Query, "isFork: true") {
-			t.Error("query does not filter forks")
-		}
-		cursors = append(cursors, req.Variables["cursor"])
-		if req.Variables["cursor"] == nil {
-			fmt.Fprint(w, `{"data":{"organization":{"repositories":{
-				"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},
-				"nodes":[
-				  {"name":"tempo","nameWithOwner":"acme/tempo","isArchived":false,"viewerPermission":"WRITE",
-				   "defaultBranchRef":{"name":"main","target":{"oid":"aaa"}},
-				   "parent":{"nameWithOwner":"grafana/tempo","defaultBranchRef":{"name":"main","target":{"oid":"bbb"}}}},
-				  {"name":"orphan","nameWithOwner":"acme/orphan","isArchived":true,"viewerPermission":"READ",
-				   "defaultBranchRef":null,"parent":null}
-				]}}}}`)
-			return
-		}
-		fmt.Fprint(w, `{"data":{"organization":{"repositories":{
-			"pageInfo":{"hasNextPage":false,"endCursor":""},
-			"nodes":[{"name":"vault","nameWithOwner":"acme/vault","isArchived":false,"viewerPermission":"ADMIN",
-			 "defaultBranchRef":{"name":"master","target":{"oid":"ccc"}},
-			 "parent":{"nameWithOwner":"hashicorp/vault","defaultBranchRef":{"name":"master","target":{"oid":"ccc"}}}}]}}}}`)
-	}))
+// discoveryServer serves both phases of fork discovery: the paginated cheap
+// listing, then the aliased detail queries. detail maps a repository name to
+// its detail payload; a name that is absent comes back as a null alias with a
+// NOT_FOUND error, the way GitHub reports a repository that has gone.
+type discoveryServer struct {
+	pages  [][]string // fork names, one slice per list page
+	detail map[string]string
 
-	forks, err := c.ListForks(context.Background(), "acme")
+	mu      sync.Mutex
+	cursors []any
+	batches [][]string
+}
+
+func (d *discoveryServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/graphql" {
+		http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Query     string         `json:"query"`
+		Variables map[string]any `json:"variables"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.Contains(req.Query, "repositories(") {
+		d.serveList(w, req.Query, req.Variables)
+		return
+	}
+	d.serveDetail(w, req.Variables)
+}
+
+func (d *discoveryServer) serveList(w http.ResponseWriter, query string, vars map[string]any) {
+	d.mu.Lock()
+	page := len(d.cursors)
+	d.cursors = append(d.cursors, vars["cursor"])
+	d.mu.Unlock()
+
+	if !strings.Contains(query, "isFork: true") {
+		http.Error(w, "listing query does not filter forks", http.StatusBadRequest)
+		return
+	}
+	if page >= len(d.pages) {
+		http.Error(w, "unexpected extra list page", http.StatusBadRequest)
+		return
+	}
+	nodes := make([]string, 0, len(d.pages[page]))
+	for _, name := range d.pages[page] {
+		nodes = append(nodes, fmt.Sprintf(
+			`{"name":%q,"nameWithOwner":%q,"isArchived":false,"viewerPermission":"WRITE"}`,
+			name, "acme/"+name))
+	}
+	last := page == len(d.pages)-1
+	fmt.Fprintf(w, `{"data":{"organization":{"repositories":{
+		"pageInfo":{"hasNextPage":%t,"endCursor":%q},
+		"nodes":[%s]}}}}`, !last, fmt.Sprintf("CUR%d", page+1), strings.Join(nodes, ","))
+}
+
+func (d *discoveryServer) serveDetail(w http.ResponseWriter, vars map[string]any) {
+	var (
+		names   []string
+		aliases []string
+		errs    []string
+	)
+	for i := 0; ; i++ {
+		v, ok := vars[fmt.Sprintf("n%d", i)]
+		if !ok {
+			break
+		}
+		name, _ := v.(string)
+		names = append(names, name)
+		det, found := d.detail[name]
+		if !found {
+			aliases = append(aliases, fmt.Sprintf(`"r%d":null`, i))
+			errs = append(errs, fmt.Sprintf(
+				`{"type":"NOT_FOUND","message":"Could not resolve to a Repository with the name 'acme/%s'."}`, name))
+			continue
+		}
+		aliases = append(aliases, fmt.Sprintf(`"r%d":%s`, i, det))
+	}
+	d.mu.Lock()
+	d.batches = append(d.batches, names)
+	d.mu.Unlock()
+
+	errBlock := ""
+	if len(errs) > 0 {
+		errBlock = fmt.Sprintf(`,"errors":[%s]`, strings.Join(errs, ","))
+	}
+	fmt.Fprintf(w, `{"data":{%s}%s}`, strings.Join(aliases, ","), errBlock)
+}
+
+// requested returns every repository name the detail phase asked about.
+func (d *discoveryServer) requested() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []string
+	for _, b := range d.batches {
+		out = append(out, b...)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func detailJSON(branch, oid, parent, parentBranch, parentOID string) string {
+	return fmt.Sprintf(`{"defaultBranchRef":{"name":%q,"target":{"oid":%q}},
+		"parent":{"nameWithOwner":%q,"defaultBranchRef":{"name":%q,"target":{"oid":%q}}}}`,
+		branch, oid, parent, parentBranch, parentOID)
+}
+
+func TestListForksDiscoversInTwoPhases(t *testing.T) {
+	srv := &discoveryServer{
+		pages: [][]string{{"tempo", "orphan"}, {"vault"}},
+		detail: map[string]string{
+			"tempo":  detailJSON("main", "aaa", "grafana/tempo", "main", "bbb"),
+			"orphan": `{"defaultBranchRef":null,"parent":null}`,
+			"vault":  detailJSON("master", "ccc", "hashicorp/vault", "master", "ccc"),
+		},
+	}
+	c, _ := newTestClient(t, srv)
+
+	var listed []int
+	var detailed [][2]int
+	forks, err := c.ListForksProgress(context.Background(), "acme", &Discovery{
+		OnListed: func(found int) { listed = append(listed, found) },
+		OnDetail: func(done, total int) { detailed = append(detailed, [2]int{done, total}) },
+	})
 	if err != nil {
-		t.Fatalf("ListForks: %v", err)
+		t.Fatalf("ListForksProgress: %v", err)
 	}
 	if len(forks) != 3 {
 		t.Fatalf("got %d forks, want 3", len(forks))
 	}
-	if len(cursors) != 2 || cursors[0] != nil || cursors[1] != "CUR1" {
-		t.Errorf("cursors = %v, want [nil CUR1]", cursors)
+	if got := srv.cursors; len(got) != 2 || got[0] != nil || got[1] != "CUR1" {
+		t.Errorf("cursors = %v, want [nil CUR1]", got)
 	}
+	if got, want := srv.requested(), []string{"orphan", "tempo", "vault"}; !slices.Equal(got, want) {
+		t.Errorf("detail phase asked for %v, want %v", got, want)
+	}
+
 	want := Fork{
 		Name: "tempo", NameWithOwner: "acme/tempo", ViewerPermission: "WRITE",
 		DefaultBranch: "main", HeadOID: "aaa",
@@ -423,11 +519,73 @@ func TestListForksPaginates(t *testing.T) {
 	if forks[0] != want {
 		t.Errorf("forks[0] = %+v\nwant %+v", forks[0], want)
 	}
-	if !forks[1].Archived || forks[1].HasParent || forks[1].DefaultBranch != "" {
-		t.Errorf("forks[1] = %+v, want archived parentless", forks[1])
+	if forks[1].HasParent || forks[1].DefaultBranch != "" || forks[1].Unresolved {
+		t.Errorf("forks[1] = %+v, want a resolved fork with no parent", forks[1])
 	}
 	if forks[2].HeadOID != forks[2].ParentHeadOID {
 		t.Errorf("forks[2] should be in sync: %+v", forks[2])
+	}
+
+	// Progress is reported per list page and per detail batch, ending complete.
+	if !slices.Equal(listed, []int{2, 3}) {
+		t.Errorf("OnListed reported %v, want [2 3]", listed)
+	}
+	if len(detailed) == 0 || detailed[len(detailed)-1] != [2]int{3, 3} {
+		t.Errorf("OnDetail ended at %v, want [3 3] last", detailed)
+	}
+}
+
+func TestListForksMarksVanishedRepoUnresolved(t *testing.T) {
+	srv := &discoveryServer{
+		pages: [][]string{{"tempo", "renamed"}},
+		detail: map[string]string{
+			"tempo": detailJSON("main", "aaa", "grafana/tempo", "main", "bbb"),
+		},
+	}
+	c, _ := newTestClient(t, srv)
+
+	forks, err := c.ListForks(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("ListForks: %v", err)
+	}
+	if len(forks) != 2 {
+		t.Fatalf("got %d forks, want 2", len(forks))
+	}
+	if forks[0].Unresolved || !forks[0].HasParent {
+		t.Errorf("forks[0] = %+v, want fully resolved", forks[0])
+	}
+	if !forks[1].Unresolved {
+		t.Errorf("forks[1] = %+v, want Unresolved: a NOT_FOUND alias must not fail the run", forks[1])
+	}
+}
+
+func TestListForksFailsOnDetailError(t *testing.T) {
+	var calls int
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(req.Query, "repositories(") {
+			fmt.Fprint(w, `{"data":{"organization":{"repositories":{
+				"pageInfo":{"hasNextPage":false,"endCursor":""},
+				"nodes":[{"name":"tempo","nameWithOwner":"acme/tempo","isArchived":false,"viewerPermission":"WRITE"}]}}}}`)
+			return
+		}
+		calls++
+		fmt.Fprint(w, `{"data":{"r0":null},"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}`)
+	}))
+
+	_, err := c.ListForks(context.Background(), "acme")
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Message != "API rate limit exceeded" {
+		t.Fatalf("error = %v, want the GraphQL message verbatim", err)
+	}
+	if calls != 1 {
+		t.Errorf("detail query ran %d times, want 1: a GraphQL error is not retried", calls)
 	}
 }
 
@@ -439,6 +597,45 @@ func TestListForksGraphQLErrors(t *testing.T) {
 	var ae *APIError
 	if !errors.As(err, &ae) || ae.Message != "Could not resolve to an Organization" {
 		t.Fatalf("error = %v, want the GraphQL message verbatim", err)
+	}
+}
+
+func TestDetailPlanCoversEveryForkInFewWaves(t *testing.T) {
+	for _, n := range []int{1, 3, 9, 46, 101, 250, 1000} {
+		batch, workers := detailPlan(n)
+		switch {
+		case batch < minDetailBatch || batch > maxDetailBatch:
+			t.Errorf("n=%d: batch = %d, want within [%d %d]", n, batch, minDetailBatch, maxDetailBatch)
+		case workers < 1 || workers > detailWorkers:
+			t.Errorf("n=%d: workers = %d, want within [1 %d]", n, workers, detailWorkers)
+		}
+		batches := (n + batch - 1) / batch
+		if batches*batch < n {
+			t.Errorf("n=%d: %d batches of %d do not cover it", n, batches, batch)
+		}
+		// One batch per worker is the whole point: waves cost a round trip each.
+		if waves := (batches + workers - 1) / workers; n <= detailWorkers*maxDetailBatch && waves != 1 {
+			t.Errorf("n=%d: %d waves of %d batches, want 1", n, waves, batches)
+		}
+	}
+}
+
+func TestListForksEmptyOrgSkipsDetailPhase(t *testing.T) {
+	var queries int
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries++
+		fmt.Fprint(w, `{"data":{"organization":{"repositories":{
+			"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[]}}}}`)
+	}))
+	forks, err := c.ListForks(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("ListForks: %v", err)
+	}
+	if len(forks) != 0 {
+		t.Fatalf("got %d forks, want 0", len(forks))
+	}
+	if queries != 1 {
+		t.Errorf("%d queries, want 1: nothing to add detail to", queries)
 	}
 }
 

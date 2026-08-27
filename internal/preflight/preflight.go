@@ -25,6 +25,17 @@ const (
 
 const ghTokenTimeout = 2 * time.Second
 
+// The check names, which double as the labels a front-end shows while each
+// probe runs.
+const (
+	checkGit      = "git on PATH"
+	checkCloneDir = "clone dir"
+	checkToken    = "token"
+	checkAuth     = "authentication"
+	checkScopes   = "scopes"
+	checkOrg      = "organization"
+)
+
 // Check is one preflight probe, reported by `forkman doctor`.
 type Check struct {
 	Name   string
@@ -65,6 +76,13 @@ type Options struct {
 	LookPath func(string) (string, error)
 	Getenv   func(string) string
 	GHToken  func(context.Context) (string, error)
+
+	// Begin and Done, when set, report progress as the checks run: Begin with
+	// the name of a check that is about to start, Done with the finished
+	// check. They let a front-end show which probe is taking the time instead
+	// of leaving the user in front of a silent terminal.
+	Begin func(name string)
+	Done  func(Check)
 }
 
 // Result is what a successful (or partially successful) preflight produced.
@@ -122,43 +140,57 @@ func Run(ctx context.Context, opts Options) (*Result, *Failure) {
 		lookPath = exec.LookPath
 	}
 	res := &Result{}
+	begin := func(name string) {
+		if opts.Begin != nil {
+			opts.Begin(name)
+		}
+	}
+	add := func(c Check) {
+		res.Checks = append(res.Checks, c)
+		if opts.Done != nil {
+			opts.Done(c)
+		}
+	}
 
 	if opts.NeedGit || opts.GitMode {
+		begin(checkGit)
 		path, err := lookPath("git")
 		if err != nil {
-			res.add(Check{Name: "git on PATH", Code: CodeGitMissing,
+			add(Check{Name: checkGit, Code: CodeGitMissing,
 				Detail: "git not found on PATH",
 				Fix:    "install git (e.g. `apt install git` / `brew install git`) and ensure it is on PATH"})
 			return res, res.failure()
 		}
-		res.add(Check{Name: "git on PATH", OK: true, Detail: path})
+		add(Check{Name: checkGit, OK: true, Detail: path})
 	}
 
 	if opts.GitMode {
+		begin(checkCloneDir)
 		if opts.CloneDir == "" {
-			res.add(Check{Name: "clone dir", Code: CodeConfig,
+			add(Check{Name: checkCloneDir, Code: CodeConfig,
 				Detail: "git mode needs a clone directory to hold the forks",
 				Fix:    "forkman configure --clone-dir=PATH"})
 			return res, res.failure()
 		}
 		if err := ensureWritable(opts.CloneDir); err != nil {
-			res.add(Check{Name: "clone dir", Code: CodeConfig,
+			add(Check{Name: checkCloneDir, Code: CodeConfig,
 				Detail: fmt.Sprintf("%s is not usable: %v", opts.CloneDir, err),
 				Fix:    "pick a writable location: forkman configure --clone-dir=PATH"})
 			return res, res.failure()
 		}
-		res.add(Check{Name: "clone dir", OK: true, Detail: opts.CloneDir + " (writable)"})
+		add(Check{Name: checkCloneDir, OK: true, Detail: opts.CloneDir + " (writable)"})
 	}
 
+	begin(checkToken)
 	token, source, err := ResolveToken(ctx, opts.Getenv, opts.GHToken)
 	if err != nil || token == "" {
-		res.add(Check{Name: "token", Code: CodeAuth,
+		add(Check{Name: checkToken, Code: CodeAuth,
 			Detail: "no GitHub token in FORKMAN_TOKEN, GH_TOKEN or GITHUB_TOKEN, and `gh auth token` failed",
 			Fix:    noTokenFix})
 		return res, res.failure()
 	}
 	res.Token = token
-	res.add(Check{Name: "token", OK: true, Detail: "from " + source})
+	add(Check{Name: checkToken, OK: true, Detail: "from " + source})
 
 	client := opts.Client
 	if client == nil {
@@ -166,6 +198,7 @@ func Run(ctx context.Context, opts Options) (*Result, *Failure) {
 	}
 	res.Client = client
 
+	begin(checkAuth)
 	user, err := client.GetUser(ctx)
 	if err != nil {
 		var ae *github.APIError
@@ -175,15 +208,16 @@ func Run(ctx context.Context, opts Options) (*Result, *Failure) {
 			detail = fmt.Sprintf("GitHub rejected the token (401: %s)", ae.Message)
 			fix = noTokenFix
 		}
-		res.add(Check{Name: "authentication", Code: CodeAuth, Detail: detail, Fix: fix})
+		add(Check{Name: checkAuth, Code: CodeAuth, Detail: detail, Fix: fix})
 		return res, res.failure()
 	}
 	res.User = user
-	res.add(Check{Name: "authentication", OK: true, Detail: "authenticated as " + user.Login})
+	add(Check{Name: checkAuth, OK: true, Detail: "authenticated as " + user.Login})
 
+	begin(checkScopes)
 	res.ScopesKnown = user.ScopesKnown
 	if !user.ScopesKnown {
-		res.add(Check{Name: "scopes", OK: true,
+		add(Check{Name: checkScopes, OK: true,
 			Detail: "token does not report scopes (fine-grained PAT); workflow-file capability could not be verified in advance"})
 	} else {
 		have := make(map[string]bool, len(user.Scopes))
@@ -192,7 +226,7 @@ func Run(ctx context.Context, opts Options) (*Result, *Failure) {
 		}
 		switch {
 		case !have["repo"]:
-			res.add(Check{Name: "scopes", Code: CodeAuth,
+			add(Check{Name: checkScopes, Code: CodeAuth,
 				Detail: "token lacks 'repo' scope; forkman cannot read or sync private forks",
 				Fix:    "gh auth refresh -s repo"})
 			return res, res.failure()
@@ -200,26 +234,27 @@ func Run(ctx context.Context, opts Options) (*Result, *Failure) {
 			// A git-mode push over ssh carries no OAuth scopes at all, so the
 			// workflow-file restriction simply does not apply.
 			if opts.GitMode && opts.Protocol != config.ProtoHTTPS {
-				res.add(Check{Name: "scopes", OK: true,
+				add(Check{Name: checkScopes, OK: true,
 					Detail: "not required in git mode (pushes go over git remote)"})
 				break
 			}
-			c := Check{Name: "scopes", Code: CodeAuth,
+			c := Check{Name: checkScopes, Code: CodeAuth,
 				Detail: "token lacks 'workflow' scope; syncs touching workflow files will fail",
 				Fix:    "gh auth refresh -s workflow"}
 			if opts.GitMode {
 				c.Detail = "token lacks 'workflow' scope; an https git push of workflow files will be rejected"
 				c.Fix = "gh auth refresh -s workflow   —or—   push over ssh: forkman configure --mode git --protocol ssh"
 			}
-			res.add(c)
+			add(c)
 			return res, res.failure()
 		default:
-			res.add(Check{Name: "scopes", OK: true, Detail: strings.Join(user.Scopes, ", ")})
+			add(Check{Name: checkScopes, OK: true, Detail: strings.Join(user.Scopes, ", ")})
 		}
 	}
 
+	begin(checkOrg)
 	if opts.Org == "" {
-		res.add(Check{Name: "organization", Code: CodeConfig,
+		add(Check{Name: checkOrg, Code: CodeConfig,
 			Detail: "no organization configured",
 			Fix:    "forkman configure --org=<name>"})
 		return res, res.failure()
@@ -232,10 +267,10 @@ func Run(ctx context.Context, opts Options) (*Result, *Failure) {
 			detail = fmt.Sprintf("organization %q not found, or this token cannot see it (a private org also returns 404 when the token lacks 'read:org')", opts.Org)
 			fix = "check the name with `forkman configure --org=<name>`; if the org is private, run: gh auth refresh -s read:org"
 		}
-		res.add(Check{Name: "organization", Code: CodeOrg, Detail: detail, Fix: fix})
+		add(Check{Name: checkOrg, Code: CodeOrg, Detail: detail, Fix: fix})
 		return res, res.failure()
 	}
-	res.add(Check{Name: "organization", OK: true, Detail: opts.Org + " visible"})
+	add(Check{Name: checkOrg, OK: true, Detail: opts.Org + " visible"})
 
 	return res, nil
 }
@@ -253,8 +288,6 @@ func ensureWritable(dir string) error {
 	f.Close()
 	return os.Remove(name)
 }
-
-func (r *Result) add(c Check) { r.Checks = append(r.Checks, c) }
 
 // failure converts the last (failed) check into a Failure.
 func (r *Result) failure() *Failure {

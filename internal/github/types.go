@@ -46,6 +46,12 @@ type Fork struct {
 	ParentDefaultBranch string
 	ParentHeadOID       string
 	HasParent           bool
+
+	// Unresolved means GitHub did not return this repository's branch and
+	// parent detail — it was renamed or removed while forkman was reading the
+	// organization. Nothing can be planned for it, so it is reported rather
+	// than quietly treated as a repository without a parent.
+	Unresolved bool
 }
 
 // Compare is the result of the REST compare endpoint.

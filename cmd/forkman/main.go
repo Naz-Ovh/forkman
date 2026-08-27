@@ -209,112 +209,271 @@ func cmdRun(args []string, kind fsync.Kind) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pf, fail := preflight.Run(ctx, preflight.Options{
-		NeedGit:  kind == fsync.KindClone,
-		GitMode:  gitMode,
-		Protocol: cfg.Protocol,
-		CloneDir: cloneDir,
-		Org:      cfg.Org,
-		Version:  version,
-	})
-	if fail != nil {
-		reportFailure(fail)
-		return fail.Code
+	sess := &session{
+		cfg:      cfg,
+		cfgPath:  cfgPath,
+		kind:     kind,
+		cloneDir: cloneDir,
+		gitMode:  gitMode,
+		full:     full != nil && *full,
 	}
+	w := &plain.Writer{W: os.Stdout, JSON: *jsonOut}
+	interactive := isTTY(os.Stdout) && isTTY(os.Stdin)
+	if *plainOut || *jsonOut || !interactive {
+		return runPlain(ctx, sess, w, *dryRun)
+	}
+	return runTUI(ctx, sess, w, *dryRun)
+}
 
-	forks, err := pf.Client.ListForks(ctx, cfg.Org)
+// runPlain is the pipe-friendly path: no alt screen, one line per repository.
+// Startup progress goes to stderr, and only when a person is watching, so a
+// pipe still gets nothing but the data.
+func runPlain(ctx context.Context, s *session, w *plain.Writer, dryRun bool) int {
+	prep, err := s.prepare(ctx, stderrSteps())
 	if err != nil {
 		if ctx.Err() != nil {
 			return exitSignal
 		}
-		fmt.Fprintln(os.Stderr, "forkman: discover forks:", err)
-		return discoverCode(err)
+		return reportPrepareFailure(err)
 	}
-
-	interactive := isTTY(os.Stdout) && isTTY(os.Stdin)
-	usePlain := *plainOut || *jsonOut || !interactive
-	tasks := fsync.Plan(forks, cfg, kind)
-
-	// First run: the config has never carried an "excluded" key.
-	if !usePlain && cfg.Excluded == nil {
-		selected, cancelled, serr := tui.RunSelector(ctx, cfg.Org, selectorItems(tasks), nil)
-		if serr != nil {
-			fmt.Fprintln(os.Stderr, "forkman:", serr)
-			return exitInternal
-		}
-		if cancelled {
-			if ctx.Err() != nil {
-				return exitSignal
-			}
-			fmt.Fprintln(os.Stderr, "forkman: cancelled")
-			return exitOK
-		}
-		if selected == nil {
-			selected = []string{}
-		}
-		cfg.Excluded = selected
-		if err := config.Save(cfgPath, cfg); err != nil {
-			fmt.Fprintln(os.Stderr, "forkman:", err)
-			return exitInternal
-		}
-		tasks = fsync.Plan(forks, cfg, kind)
+	if dryRun {
+		return dryRunReport(w, prep.Tasks, s.kind, s.gitMode)
 	}
-
-	w := &plain.Writer{W: os.Stdout, JSON: *jsonOut}
-	if *dryRun {
-		return dryRunReport(w, tasks, kind, gitMode)
-	}
-
-	runner := &fsync.Runner{
-		Client:      pf.Client,
-		Concurrency: cfg.Concurrency,
-		Kind:        kind,
-		CloneDir:    cloneDir,
-		FullClone:   full != nil && *full,
-		Org:         cfg.Org,
-		GitMode:     gitMode,
-		Protocol:    cfg.Protocol,
-	}
-	events := make(chan fsync.Event, 128)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go runner.Run(runCtx, tasks, events)
 
-	var (
-		results     []fsync.Result
-		interrupted bool
-	)
-	if usePlain {
-		results, interrupted = consumePlain(runCtx, events, w)
-	} else {
-		results, interrupted, err = tui.Run(runCtx, tui.Options{
-			Org:           cfg.Org,
-			Kind:          kind,
-			Tasks:         tasks,
-			Events:        events,
-			Cancel:        cancel,
-			RateRemaining: pf.Client.RateRemaining,
-			Plain:         tui.PlainFromEnv(os.Getenv),
-			Version:       version,
-			ScopesKnown:   pf.ScopesKnown,
-		})
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "forkman:", err)
-			return exitInternal
-		}
-		results = append(results, drain(events, 2*time.Second)...)
-	}
+	results, interrupted := consumePlain(runCtx, s.start(runCtx, prep.Tasks), w)
 	if ctx.Err() != nil {
 		interrupted = true
 	}
-
 	summary := fsync.Summarize(results)
-	if usePlain {
-		w.Summary(summary)
-	} else {
-		printSummary(os.Stdout, summary, pf)
-	}
+	w.Summary(summary)
 	return fsync.ExitCode(summary, interrupted)
+}
+
+// runTUI opens the alt screen first and runs the preflight checks, fork
+// discovery and the work itself inside it, so none of the waiting happens on a
+// blank terminal.
+func runTUI(ctx context.Context, s *session, w *plain.Writer, dryRun bool) int {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	opts := tui.Options{
+		Org:     s.cfg.Org,
+		Kind:    s.kind,
+		Plain:   tui.PlainFromEnv(os.Getenv),
+		Version: version,
+		Cancel:  cancel,
+		Prepare: s.prepare,
+		Confirm: s.confirm,
+	}
+	if !dryRun {
+		opts.Start = func(tasks []fsync.Task) <-chan fsync.Event {
+			return s.start(runCtx, tasks)
+		}
+	}
+	out, err := tui.Run(ctx, opts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "forkman:", err)
+		return exitInternal
+	}
+	// A failure leaves no plan behind either, so it is asked about before the
+	// "nothing ran" case — unless the user's own cancellation is what caused it.
+	switch {
+	case out.Err != nil && !out.Cancelled:
+		return reportPrepareFailure(out.Err)
+	case out.Cancelled || out.Tasks == nil:
+		// Nothing ran, so there is nothing to summarise.
+		fmt.Fprintln(os.Stderr, "forkman: cancelled")
+		if out.Interrupted {
+			return exitSignal
+		}
+		return exitOK
+	case dryRun:
+		return dryRunReport(w, out.Tasks, s.kind, s.gitMode)
+	}
+
+	results := out.Results
+	if s.events != nil {
+		results = append(results, drain(s.events, 2*time.Second)...)
+	}
+	summary := fsync.Summarize(results)
+	printSummary(os.Stdout, summary, s.pf)
+	return fsync.ExitCode(summary, out.Interrupted || ctx.Err() != nil)
+}
+
+// session holds what one run was invoked with, plus the preflight and
+// discovery results once they exist. Both front-ends drive the same three
+// methods, which is what lets the TUI run preflight from inside the alt screen
+// while the plain path runs it straight through.
+type session struct {
+	cfg      *config.Config
+	cfgPath  string
+	kind     fsync.Kind
+	cloneDir string
+	gitMode  bool
+	full     bool
+	// alwaysSelect offers the exclusion selector even when the config already
+	// carries a list, which is what `forkman configure` with no flags does.
+	alwaysSelect bool
+
+	pf     *preflight.Result
+	forks  []github.Fork
+	events <-chan fsync.Event
+}
+
+// prepare runs the preflight checks and fork discovery, reporting each step
+// through report as it starts and finishes. report may be nil.
+func (s *session) prepare(ctx context.Context, report func(tui.Step)) (*tui.Prepared, error) {
+	step := func(key, label, detail string, state tui.StepState) {
+		if report != nil {
+			report(tui.Step{Key: key, Label: label, Detail: detail, State: state})
+		}
+	}
+
+	pf, fail := preflight.Run(ctx, preflight.Options{
+		NeedGit:  s.kind == fsync.KindClone,
+		GitMode:  s.gitMode,
+		Protocol: s.cfg.Protocol,
+		CloneDir: s.cloneDir,
+		Org:      s.cfg.Org,
+		Version:  version,
+		Begin:    func(name string) { step(name, name, "", tui.StepRunning) },
+		Done: func(c preflight.Check) {
+			state := tui.StepOK
+			if !c.OK {
+				state = tui.StepFail
+			}
+			step(c.Name, c.Name, c.Detail, state)
+		},
+	})
+	s.pf = pf
+	if fail != nil {
+		return nil, fail
+	}
+
+	// Discovery is the long pole — resolving every fork's upstream parent is
+	// what GitHub spends seconds on — so it reports as it lands.
+	const dk, dl = "discover", "discover forks"
+	step(dk, dl, "listing "+s.cfg.Org+"'s forks", tui.StepRunning)
+	forks, err := pf.Client.ListForksProgress(ctx, s.cfg.Org, &github.Discovery{
+		OnListed: func(found int) {
+			step(dk, dl, fmt.Sprintf("%d forks · reading branches and parents", found), tui.StepRunning)
+		},
+		OnDetail: func(done, total int) {
+			step(dk, dl, fmt.Sprintf("%d forks · branches and parents %d/%d", total, done, total), tui.StepRunning)
+		},
+	})
+	if err != nil {
+		step(dk, dl, err.Error(), tui.StepFail)
+		return nil, fmt.Errorf("discover forks: %w", err)
+	}
+	step(dk, dl, fmt.Sprintf("%d forks", len(forks)), tui.StepOK)
+	s.forks = forks
+
+	tasks := fsync.Plan(forks, s.cfg, s.kind)
+	step("plan", "plan", planDetail(tasks, s.kind), tui.StepOK)
+	return &tui.Prepared{
+		Tasks: tasks,
+		// A config that has never carried an "excluded" key is a first run.
+		NeedSelect:    s.alwaysSelect || s.cfg.Excluded == nil,
+		Items:         selectorItems(tasks),
+		Preselected:   s.cfg.Excluded,
+		RateRemaining: pf.Client.RateRemaining,
+		ScopesKnown:   pf.ScopesKnown,
+	}, nil
+}
+
+// confirm stores the exclusions the selector produced and re-plans with them.
+func (s *session) confirm(excluded []string) ([]fsync.Task, error) {
+	if excluded == nil {
+		excluded = []string{}
+	}
+	s.cfg.Excluded = excluded
+	if err := config.Save(s.cfgPath, s.cfg); err != nil {
+		return nil, err
+	}
+	return fsync.Plan(s.forks, s.cfg, s.kind), nil
+}
+
+// start launches the runner and hands back the channel it publishes on.
+func (s *session) start(ctx context.Context, tasks []fsync.Task) <-chan fsync.Event {
+	runner := &fsync.Runner{
+		Client:      s.pf.Client,
+		Concurrency: s.cfg.Concurrency,
+		Kind:        s.kind,
+		CloneDir:    s.cloneDir,
+		FullClone:   s.full,
+		Org:         s.cfg.Org,
+		GitMode:     s.gitMode,
+		Protocol:    s.cfg.Protocol,
+	}
+	events := make(chan fsync.Event, 128)
+	s.events = events
+	go runner.Run(ctx, tasks, events)
+	return events
+}
+
+// planDetail summarises the plan for the startup checklist.
+func planDetail(tasks []fsync.Task, kind fsync.Kind) string {
+	todo, current, skipped := 0, 0, 0
+	for _, t := range tasks {
+		switch {
+		case t.Skip:
+			skipped++
+		case kind == fsync.KindSync && t.UpToDate:
+			current++
+		default:
+			todo++
+		}
+	}
+	verb := "sync"
+	if kind == fsync.KindClone {
+		verb = "clone"
+	}
+	parts := []string{fmt.Sprintf("%d to %s", todo, verb)}
+	if current > 0 {
+		parts = append(parts, fmt.Sprintf("%d up to date", current))
+	}
+	if skipped > 0 {
+		parts = append(parts, fmt.Sprintf("%d skipped", skipped))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// stderrSteps prints startup progress for the plain path, one line per
+// finished step. It returns nil when stderr is not a terminal: --plain and
+// --json are meant to be piped, and a pipe should get data, not progress.
+func stderrSteps() func(tui.Step) {
+	if !isTTY(os.Stderr) {
+		return nil
+	}
+	return func(s tui.Step) {
+		if s.State == tui.StepRunning {
+			return
+		}
+		mark := "·"
+		if s.State == tui.StepFail {
+			mark = "✖"
+		}
+		label := s.Label
+		if label == "" {
+			label = s.Key
+		}
+		fmt.Fprintf(os.Stderr, "%s %-14s %s\n", mark, label, s.Detail)
+	}
+}
+
+// reportPrepareFailure prints a preflight or discovery failure on the normal
+// screen, once the alt screen is gone, and maps it to an exit code.
+func reportPrepareFailure(err error) int {
+	var f *preflight.Failure
+	if errors.As(err, &f) {
+		reportFailure(f)
+		return f.Code
+	}
+	fmt.Fprintln(os.Stderr, "forkman:", err)
+	return discoverCode(err)
 }
 
 func discoverCode(err error) int {
@@ -524,37 +683,30 @@ func configureInteractive(path string, cfg *config.Config) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pf, fail := preflight.Run(ctx, preflight.Options{Org: cfg.Org, Version: version})
-	if fail != nil {
-		reportFailure(fail)
-		return fail.Code
-	}
-	forks, err := pf.Client.ListForks(ctx, cfg.Org)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "forkman: discover forks:", err)
-		return discoverCode(err)
-	}
-	tasks := fsync.Plan(forks, cfg, fsync.KindSync)
-	selected, cancelled, err := tui.RunSelector(ctx, cfg.Org, selectorItems(tasks), cfg.Excluded)
+	sess := &session{cfg: cfg, cfgPath: path, kind: fsync.KindSync, alwaysSelect: true}
+	out, err := tui.Run(ctx, tui.Options{
+		Org:     cfg.Org,
+		Kind:    fsync.KindSync,
+		Plain:   tui.PlainFromEnv(os.Getenv),
+		Version: version,
+		Prepare: sess.prepare,
+		Confirm: sess.confirm,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "forkman:", err)
 		return exitInternal
 	}
-	if cancelled {
+	switch {
+	case out.Err != nil && !out.Cancelled:
+		return reportPrepareFailure(out.Err)
+	case out.Cancelled || out.Tasks == nil:
 		fmt.Fprintln(os.Stderr, "forkman: cancelled, config unchanged")
-		if ctx.Err() != nil {
+		if out.Interrupted {
 			return exitSignal
 		}
 		return exitOK
 	}
-	if selected == nil {
-		selected = []string{}
-	}
-	cfg.Excluded = selected
-	if err := config.Save(path, cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "forkman:", err)
-		return exitInternal
-	}
+	// confirm saved the selection through the same *config.Config.
 	printConfig(os.Stdout, path, cfg)
 	return exitOK
 }

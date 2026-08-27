@@ -1,10 +1,7 @@
 package tui
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"unicode"
@@ -42,28 +39,6 @@ func Match(pattern, s string) (bool, []int) {
 	return false, nil
 }
 
-// RunSelector runs the exclusion selector and returns the selected names,
-// sorted. cancelled is true when the user pressed esc.
-func RunSelector(ctx context.Context, org string, items []SelectorItem, preselected []string) ([]string, bool, error) {
-	p := tea.NewProgram(newSelectorModel(org, items, preselected, NewTheme(PlainFromEnv(os.Getenv))),
-		tea.WithContext(ctx),
-		tea.WithoutSignalHandler(),
-		tea.WithFPS(30),
-	)
-	final, err := p.Run()
-	if err != nil {
-		if errors.Is(err, tea.ErrInterrupted) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			return nil, true, nil
-		}
-		return nil, false, err
-	}
-	m, ok := final.(selectorModel)
-	if !ok || m.cancelled {
-		return nil, true, nil
-	}
-	return m.selected(), false, nil
-}
-
 type selectorModel struct {
 	th    Theme
 	org   string
@@ -79,7 +54,12 @@ type selectorModel struct {
 
 	cursor, top   int
 	width, height int
-	cancelled     bool
+
+	// done and cancelled report how the selector ended. The selector never
+	// quits the program itself: the model that hosts it reads these and
+	// decides what comes next.
+	done      bool
+	cancelled bool
 }
 
 func newSelectorModel(org string, items []SelectorItem, preselected []string, th Theme) selectorModel {
@@ -153,9 +133,7 @@ func (m selectorModel) Init() tea.Cmd { return nil }
 func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
-		m.filter.SetWidth(max(4, m.w()-14))
-		m.ensureVisible()
+		m.resize(msg.Width, msg.Height)
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -167,6 +145,14 @@ func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	return m, nil
+}
+
+// resize lays the selector out for a new terminal size. It is also called
+// directly, because the selector may appear after the size is already known.
+func (m *selectorModel) resize(w, h int) {
+	m.width, m.height = w, h
+	m.filter.SetWidth(max(4, m.w()-14))
+	m.ensureVisible()
 }
 
 func (m selectorModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -183,7 +169,7 @@ func (m selectorModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+c":
 			m.cancelled = true
-			return m, tea.Quit
+			return m, nil
 		case "up":
 			m.moveCursor(-1)
 			return m, nil
@@ -224,10 +210,9 @@ func (m selectorModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.filtering = true
 		return m, m.filter.Focus()
 	case "enter":
-		return m, tea.Quit
+		m.done = true
 	case "esc", "q", "ctrl+c":
 		m.cancelled = true
-		return m, tea.Quit
 	}
 	return m, nil
 }
