@@ -9,7 +9,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 all: vet test build size
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) .
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) ./cmd/forkman
 
 test:
 	go test -race ./...
@@ -30,7 +30,7 @@ release:
 		if [ "$$os" = "windows" ]; then ext=".exe"; fi; \
 		echo "building dist/forkman_$${os}_$${arch}$$ext"; \
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
-			go build -trimpath -ldflags="$(LDFLAGS)" -o dist/forkman_$${os}_$${arch}$$ext . || exit 1; \
+			go build -trimpath -ldflags="$(LDFLAGS)" -o dist/forkman_$${os}_$${arch}$$ext ./cmd/forkman || exit 1; \
 	done
 
 size: build

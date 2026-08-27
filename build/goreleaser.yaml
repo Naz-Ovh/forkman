@@ -13,7 +13,7 @@ before:
 
 builds:
   - id: forkman
-    main: .
+    main: ./cmd/forkman
     binary: forkman
     env:
       - CGO_ENABLED=0

@@ -26,9 +26,9 @@ From source:
 make build      # -> bin/forkman
 ```
 
-Releases are built by [GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`) for `linux/{amd64,arm64}`,
+Releases are built by [GoReleaser](https://goreleaser.com) (`build/goreleaser.yaml`) for `linux/{amd64,arm64}`,
 `darwin/{amd64,arm64}` and `windows/amd64`, from both GitHub Actions (`.github/workflows/release.yml`) and
-GitLab CI (`.gitlab-ci.yml`) on any `v*` tag.
+GitLab CI (`build/ci/gitlab-ci.yml`, set as the custom CI config path in the GitLab project settings) on any `v*` tag.
 
 ## Usage
 
